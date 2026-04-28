@@ -71,62 +71,10 @@ function Invoke-WithRetry {
             if ($attempt -ge $MaxAttempts) {
                 throw
             }
-            Write-Log "  [Retry $attempt/$MaxAttempts] Waiting ${delayMs}ms before retry: $($_.Exception.Message)" 'WARN'
+            Write-Host "  [Retry $attempt/$MaxAttempts] Waiting ${delayMs}ms before retry: $($_.Exception.Message)" -ForegroundColor Yellow
             Start-Sleep -Milliseconds $delayMs
             $delayMs = [Math]::Min($delayMs * 2, 4000)  # cap at 4 seconds
         }
-    }
-}
-
-# ============================================================
-# Log to local %TEMP%, will be copied to network at the end
-# ============================================================
-$Script:LogFile = $null
-$Script:LocalLogPath = $null
-$Script:NetworkLogPath = $null
-$Script:LogStream = $null
-
-function Initialize-Log {
-    param([string] $NetworkPath)
-    
-    # Ensure network log dir exists
-    $networkDir = Split-Path -Parent $NetworkPath
-    Invoke-WithRetry {
-        if (-not (Test-Path $networkDir)) {
-            New-Item -ItemType Directory -Path $networkDir -Force | Out-Null
-        }
-    }
-    
-    # Create log in local %TEMP% (AV doesn't scan it aggressively)
-    $localDir = Join-Path $env:TEMP 'AMCLogs'
-    Invoke-WithRetry {
-        if (-not (Test-Path $localDir)) {
-            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
-        }
-    }
-    
-    $logFileName = 'run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)
-    $Script:LocalLogPath = Join-Path $localDir $logFileName
-    $Script:NetworkLogPath = $NetworkPath
-    
-    # Open local log file with StreamWriter for persistent handle
-    Invoke-WithRetry {
-        $fs = [System.IO.File]::Open($Script:LocalLogPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
-        $Script:LogStream = New-Object System.IO.StreamWriter($fs, ([System.Text.UTF8Encoding]::new($false)))
-        $Script:LogStream.AutoFlush = $true
-    }
-    
-    $Script:LogFile = $Script:LocalLogPath
-}
-
-function Close-Log {
-    if ($Script:LogStream) {
-        try {
-            $Script:LogStream.Flush()
-            $Script:LogStream.Dispose()
-        }
-        catch { }
-        $Script:LogStream = $null
     }
 }
 
@@ -135,20 +83,6 @@ function Write-Log {
         [string] $Message,
         [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'DRY')] [string] $Level = 'INFO'
     )
-    
-    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = '[{0}] [{1,-5}] {2}' -f $stamp, $Level, $Message
-    
-    if ($Script:LogStream) {
-        try {
-            $Script:LogStream.WriteLine($line)
-        }
-        catch {
-            Start-Sleep -Milliseconds 50
-            try { $Script:LogStream.WriteLine($line) } catch { }
-        }
-    }
-    
     $color = switch ($Level) {
         'ERROR' { 'Red' }
         'WARN' { 'Yellow' }
@@ -156,30 +90,9 @@ function Write-Log {
         'DRY' { 'Cyan' }
         default { 'Gray' }
     }
-    Write-Host $line -ForegroundColor $color
+    Write-Host "[$Level] $Message" -ForegroundColor $color
 }
 
-function Copy-LogToNetwork {
-    # Best-effort copy: if network copy fails, at least print where the local log is
-    try {
-        Invoke-WithRetry {
-            $networkDir = Split-Path -Parent $Script:NetworkLogPath
-            if (-not (Test-Path $networkDir)) {
-                New-Item -ItemType Directory -Path $networkDir -Force | Out-Null
-            }
-            Copy-Item -Path $Script:LocalLogPath -Destination $Script:NetworkLogPath -Force
-        }
-        Write-Log "Log copied to network: $Script:NetworkLogPath" 'OK'
-        return $Script:NetworkLogPath
-    }
-    catch {
-        Write-Log "WARNING: Could not copy log to network ($($_.Exception.Message))" 'WARN'
-        Write-Log "Local log path: $Script:LocalLogPath" 'WARN'
-        Write-Host ""
-        Write-Host "  ⚠️  Local log fallback: $Script:LocalLogPath" -ForegroundColor Yellow
-        return $Script:LocalLogPath
-    }
-}
 # ============================================================
 # Helper: safely read a cell value (handles error cells)
 # ============================================================
@@ -294,7 +207,7 @@ function Read-PatientFile {
     )
 
     Invoke-WithRetry {
-        $wb = $ExcelApp.Workbooks.Open($Path, [Type]::Missing, $true)
+        $wb = $ExcelApp.Workbooks.Open($Path)
         try {
             $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
 
@@ -413,34 +326,43 @@ function Write-TrackerRow {
 
     $fc = $Cfg.FixedColumns
 
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.SerialNumber)).Value2 = $SerialNumber
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateAMC)).Value2 = $Patient.DateAMC
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateReview)).Value2 = $Patient.DateReview
+    function Set-Cell {
+        param($ColLetter, $Val)
+        if ($null -ne $Val) {
+            $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $ColLetter)).Value2 = $Val
+        }
+    }
+
+    Set-Cell $fc.SerialNumber $SerialNumber
+    Set-Cell $fc.DateAMC $Patient.DateAMC
+    Set-Cell $fc.DateReview $Patient.DateReview
 
     # Iqama: write as text to preserve full digit precision
-    $iqamaCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Iqama))
-    $iqamaCell.NumberFormat = '@'
-    $iqamaCell.Value2 = $Patient.Iqama
+    if ($null -ne $Patient.Iqama) {
+        $iqamaCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Iqama))
+        $iqamaCell.NumberFormat = '@'
+        $iqamaCell.Value2 = $Patient.Iqama
+    }
 
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Name)).Value2 = $Patient.Name
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Company)).Value2 = $Patient.Company
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Height)).Value2 = $Patient.Height
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Weight)).Value2 = $Patient.Weight
+    Set-Cell $fc.Name $Patient.Name
+    Set-Cell $fc.Company $Patient.Company
+    Set-Cell $fc.Height $Patient.Height
+    Set-Cell $fc.Weight $Patient.Weight
 
     # BMI as a live formula
     $bmiCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.BMIFormula))
     $bmiCell.Formula = '=J{0}/(I{0}/100)^2' -f $RowIndex
 
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Age)).Value2 = $Patient.Age
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.BloodPress)).Value2 = $Patient.BloodPress
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Status)).Value2 = $Patient.Status
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Comment)).Value2 = $Patient.Comment
+    Set-Cell $fc.Age $Patient.Age
+    Set-Cell $fc.BloodPress $Patient.BloodPress
+    Set-Cell $fc.Status $Patient.Status
+    Set-Cell $fc.Comment $Patient.Comment
 
     # Test result columns
     foreach ($col in @($Patient.Tests.Keys)) {
         $value = $Patient.Tests[$col]
         if ($null -eq $value) { continue }   # leave the cell blank (e.g. PSA <40)
-        $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $value
+        Set-Cell $col $value
     }
 }
 
@@ -509,9 +431,6 @@ foreach ($d in @($CompaniesDir, $ArchiveDir, $LogsDir)) {
     }
 }
 
-# Initialize local log (will be copied to network at end)
-Initialize-Log (Join-Path $LogsDir ('run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)))
-
 Write-Log '======================================================'
 Write-Log "AMC Automation start (Company='$Company', DryRun=$DryRun, NoArchive=$NoArchive)"
 Write-Log "Root: $RootDir"
@@ -520,8 +439,6 @@ Write-Log '======================================================'
 
 if (-not (Test-Path $TrackerPath)) {
     Write-Log "Tracker file not found: $TrackerPath" 'ERROR'
-    Close-Log
-    Copy-LogToNetwork
     exit 1
 }
 
@@ -533,8 +450,6 @@ else {
     $hit = $AllKeys | Where-Object { $_ -ieq $Company }
     if (-not $hit) {
         Write-Log "Unknown company key '$Company'. Valid keys: $($AllKeys -join ', ')" 'ERROR'
-        Close-Log
-        Copy-LogToNetwork
         exit 1
     }
     @($hit)
@@ -570,7 +485,7 @@ $perCompanyStats = [ordered]@{}
 
 try {
     $Tracker = Invoke-WithRetry {
-        $Excel.Workbooks.Open($TrackerPath, [Type]::Missing, $false)
+        $Excel.Workbooks.Open($TrackerPath)
     }
 
     $companyIdx = 0
@@ -814,13 +729,8 @@ if ($rowsWithActivity.Count -gt 0) {
     Write-Host ''
 }
 
-# Determine final log path (network or local fallback)
-$finalLogPath = Copy-LogToNetwork
-
 Write-Host '   Tracker:  ' -NoNewline -ForegroundColor DarkGray
 Write-Host $TrackerPath -ForegroundColor Gray
-Write-Host '   Log file: ' -NoNewline -ForegroundColor DarkGray
-Write-Host $finalLogPath -ForegroundColor Gray
 Write-Host '  ============================================================' -ForegroundColor Cyan
 Write-Host ''
 
@@ -828,7 +738,5 @@ Write-Log ''
 Write-Log '======================================================'
 Write-Log ("Done. Processed={0}  Skipped={1}  Errors={2}  Elapsed={3}" -f $totalProcessed, $totalSkipped, $totalErrors, $elapsedStr)
 Write-Log '======================================================'
-
-Close-Log
 
 if ($totalErrors -gt 0) { exit 1 } else { exit 0 }
