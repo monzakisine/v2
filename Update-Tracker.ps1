@@ -181,7 +181,49 @@ function Copy-LogToNetwork {
     }
 }
 # ============================================================
-# Helper: convert column letter -> column index
+# Helper: safely read a cell value (handles error cells)
+# ============================================================
+function Get-SafeCellValue {
+    param(
+        [Parameter(Mandatory)] $Cell,
+        [string] $DefaultValue = $null
+    )
+    
+    try {
+        if ($null -eq $Cell) { return $DefaultValue }
+        
+        # Check if cell contains an error value (#N/A, #VALUE!, etc.)
+        $text = $Cell.Text
+        if ($null -ne $text) {
+            $text = [string]$text
+            # Error cells start with #
+            if ($text.StartsWith('#')) {
+                return $DefaultValue
+            }
+        }
+        
+        # Try to safely read Value2
+        $val = $null
+        try {
+            $val = $Cell.Value2
+        }
+        catch {
+            # If Value2 fails, try Text
+            return $DefaultValue
+        }
+        
+        # Check if it's a DBNull
+        if ($val -is [System.DBNull]) {
+            return $DefaultValue
+        }
+        
+        return $val
+    }
+    catch {
+        return $DefaultValue
+    }
+}
+
 # ============================================================
 function ConvertTo-ColIndex {
     param([string] $Letter)
@@ -252,7 +294,7 @@ function Read-PatientFile {
     )
 
     Invoke-WithRetry {
-        $wb = $ExcelApp.Workbooks.Open($Path, $false, $true)
+        $wb = $ExcelApp.Workbooks.Open($Path, $false, $true, , , , $false, , , $false, $false)
         try {
             $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
 
@@ -277,22 +319,8 @@ function Read-PatientFile {
                 try {
                     $addr = $Cfg.PatientCells[$k]
                     $cell = $sheet.Range($addr)
-                    
-                    # Check for error values (#N/A, #VALUE!, etc.)
-                    if ($null -eq $cell.Value2) {
-                        $data[$k] = $null
-                    }
-                    else {
-                        # Try to access the value; if it fails, leave it null
-                        $val = $null
-                        if ($cell.Value2 -is [System.DBNull]) {
-                            $val = $null
-                        }
-                        else {
-                            $val = $cell.Value2
-                        }
-                        $data[$k] = $val
-                    }
+                    $val = Get-SafeCellValue $cell
+                    $data[$k] = $val
                 }
                 catch {
                     Write-Log "    Warning: Could not read cell $addr for field '$k': $($_.Exception.Message)" 'WARN'
@@ -313,15 +341,10 @@ function Read-PatientFile {
                 foreach ($addr in $s.CheckCells) {
                     try {
                         $cell = $sheet.Range($addr)
-                        if ($null -ne $cell.Value2) {
-                            $cv = $cell.Value2
-                            if ($cv -is [System.DBNull]) {
-                                continue
-                            }
-                            if ("$cv".Trim() -ne '') {
-                                $detectedStatus = $s.Label
-                                break
-                            }
+                        $cv = Get-SafeCellValue $cell
+                        if ($null -ne $cv -and "$cv".Trim() -ne '') {
+                            $detectedStatus = $s.Label
+                            break
                         }
                     }
                     catch {
@@ -515,7 +538,12 @@ $Excel = New-Object -ComObject Excel.Application
 $Excel.Visible = $false
 $Excel.DisplayAlerts = $false
 $Excel.AskToUpdateLinks = $false
+$Excel.ScreenUpdating = $false
 try { $Excel.AutomationSecurity = 3 } catch { }
+try { $Excel.AlertBeforeOverwriting = $false } catch { }
+
+# Set to not show any updates or prompts during macro operations
+try { $Excel.EnableEvents = $false } catch { }
 
 $Tracker = $null
 $totalProcessed = 0
@@ -525,7 +553,9 @@ $startTime = Get-Date
 $perCompanyStats = [ordered]@{}
 
 try {
-    $Tracker = Invoke-WithRetry { $Excel.Workbooks.Open($TrackerPath, $false, $false) }
+    $Tracker = Invoke-WithRetry {
+        $Excel.Workbooks.Open($TrackerPath, $false, $false, , , , $false, , , $false, $false)
+    }
 
     $companyIdx = 0
     $companyTotal = $keys.Count
