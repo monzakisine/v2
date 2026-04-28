@@ -94,6 +94,24 @@ function Write-Log {
 }
 
 # ============================================================
+# Helper: pre-hydrate cloud files and disable Protected View
+# ============================================================
+function Assert-FileReady {
+    param([string]$FilePath)
+    if (-not (Test-Path $FilePath)) { return }
+    
+    # 1. Unblock file (removes Mark of the Web, prevents Protected View lockouts)
+    try { Unblock-File -Path $FilePath -ErrorAction SilentlyContinue } catch { }
+    
+    # 2. Force OneDrive / SharePoint / Network hydration synchronously.
+    # This completely prevents the Excel "Downloading..." UI from popping up
+    # and hanging the COM background process.
+    try {
+        $null = [System.IO.File]::ReadAllBytes($FilePath)
+    } catch { }
+}
+
+# ============================================================
 # Helper: safely read a cell value (handles error cells)
 # ============================================================
 function Get-SafeCellValue {
@@ -109,16 +127,6 @@ function Get-SafeCellValue {
         # Use strictly [int] casts to prevent COM variant cast issues
         $singleCell = $Cell.Cells.Item([int]1, [int]1)
         
-        # Check if cell contains an error value (#N/A, #VALUE!, etc.)
-        $text = $singleCell.Text
-        if ($null -ne $text) {
-            $text = [string]$text
-            # Error cells start with #
-            if ($text.StartsWith('#')) {
-                return $DefaultValue
-            }
-        }
-        
         # Try to safely read Value2
         $val = $null
         try {
@@ -130,7 +138,14 @@ function Get-SafeCellValue {
         }
         
         # Check if it's a DBNull
-        if ($val -is [System.DBNull]) {
+        if ($null -eq $val -or $val -is [System.DBNull]) {
+            return $DefaultValue
+        }
+
+        # CRITICAL FIX: If the cell contains an Excel formula error (like #N/A or #VALUE!),
+        # powershell wraps it in a System.__ComObject. If we return this and later try to write
+        # it to the Tracker, it will instantly trigger "Specified cast is not valid".
+        if ($val -is [System.__ComObject]) {
             return $DefaultValue
         }
         
@@ -210,11 +225,13 @@ function Read-PatientFile {
         [Parameter(Mandatory)] [hashtable] $Cfg
     )
 
+    Assert-FileReady -FilePath $Path
+
     Invoke-WithRetry {
         $wb = $ExcelApp.Workbooks.Open([string]$Path)
         try {
             [string]$sheetName = $Cfg.SourceSheet
-        $sheet = $wb.Sheets.Item($sheetName)
+            $sheet = $wb.Sheets.Item($sheetName)
 
             $data = [ordered]@{
                 SourceFile = $Path
@@ -336,6 +353,7 @@ function Write-TrackerRow {
     function Set-Cell {
         param([string]$ColLetter, $Val)
         if ($null -ne $Val) {
+            if ($Val -is [System.__ComObject]) { return } # Extreme failsafe against proxy error leaks
             [int]$c = ConvertTo-ColIndex $ColLetter
             if ($Val -is [DateTime]) { $Val = $Val.ToString('yyyy/MM/dd') }
             $Sheet.Cells.Item($r, $c).Value2 = $Val
@@ -495,6 +513,8 @@ $startTime = Get-Date
 $perCompanyStats = [ordered]@{}
 
 try {
+    Assert-FileReady -FilePath $TrackerPath
+
     $Tracker = Invoke-WithRetry {
         $Excel.Workbooks.Open([string]$TrackerPath)
     }
