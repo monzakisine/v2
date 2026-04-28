@@ -183,3 +183,73 @@ file, find which cell has the checkmark, and add it to
 **Excel process stays open after a crash** — open Task Manager and
 end any orphan `EXCEL.EXE` processes. The script tries to clean up,
 but a hard crash can leave one behind.
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------------------
+
+
+
+
+
+[2026-04-28 14:46:24] [INFO ] ======================================================
+[2026-04-28 14:46:24] [INFO ] AMC Automation start (Company='almutairi', DryRun=False, NoArchive=False)
+[2026-04-28 14:46:24] [INFO ] Root: S:\AlBaithaMineClinic\AMC-automation
+[2026-04-28 14:46:24] [INFO ] Tracker: S:\AlBaithaMineClinic\AMC-automation\Tracker\Contractors_AMC_Tracker_2026.xlsm
+[2026-04-28 14:46:24] [INFO ] ======================================================
+[2026-04-28 14:46:26] [INFO ] Tracker backup -> S:\AlBaithaMineClinic\AMC-automation\Logs\tracker-backup-2026-04-28_144624.xlsm
+[2026-04-28 14:46:26] [INFO ] Launching Excel (hidden)...
+[2026-04-28 14:46:31] [INFO ] 
+[2026-04-28 14:46:31] [INFO ] --- [1/1] almutairi  (sheet='AL MUTAIRI', folder='AL MUTAIRI') ---
+[2026-04-28 14:46:32] [INFO ] Next free row: 57  (SN=56)  Files to process: 18
+[2026-04-28 14:46:32] [INFO ] Reading: 2310366824.xlsm
+[2026-04-28 14:46:36] [ERROR]   ERROR processing 2310366824.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:36] [INFO ] Reading: 2337890806.xlsm
+[2026-04-28 14:46:40] [ERROR]   ERROR processing 2337890806.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:40] [INFO ] Reading: 2374357172.xlsm
+[2026-04-28 14:46:43] [ERROR]   ERROR processing 2374357172.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:43] [INFO ] Reading: 2437714088.xlsm
+[2026-04-28 14:46:46] [ERROR]   ERROR processing 2437714088.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:46] [INFO ] Reading: 2489002960.xlsm
+[2026-04-28 14:46:49] [ERROR]   ERROR processing 2489002960.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:49] [INFO ] Reading: 2506419809.xlsm
+[2026-04-28 14:46:53] [ERROR]   ERROR processing 2506419809.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:53] [INFO ] Reading: 2519482182.xlsm
+[2026-04-28 14:46:56] [ERROR]   ERROR processing 2519482182.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:56] [INFO ] Reading: 2520595808.xlsm
+[2026-04-28 14:46:59] [ERROR]   ERROR processing 2520595808.xlsm: Specified cast is not valid.
+[2026-04-28 14:46:59] [INFO ] Reading: 2521413357.xlsm
+[2026-04-28 14:47:02] [ERROR]   ERROR processing 2521413357.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:02] [INFO ] Reading: 2545034759.xlsm
+[2026-04-28 14:47:05] [ERROR]   ERROR processing 2545034759.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:06] [INFO ] Reading: 2556565113.xlsm
+[2026-04-28 14:47:08] [ERROR]   ERROR processing 2556565113.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:08] [INFO ] Reading: 2557739535.xlsm
+[2026-04-28 14:47:12] [ERROR]   ERROR processing 2557739535.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:12] [INFO ] Reading: 2569900356.xlsm
+[2026-04-28 14:47:15] [ERROR]   ERROR processing 2569900356.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:15] [INFO ] Reading: 2621160316.xlsm
+[2026-04-28 14:47:18] [ERROR]   ERROR processing 2621160316.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:18] [INFO ] Reading: 2621162094.xlsm
+[2026-04-28 14:47:21] [WARN ]   Iqama 2621162094 already in sheet. Adding new row anyway (config: warn).
+[2026-04-28 14:47:21] [ERROR]   ERROR processing 2621162094.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:21] [INFO ] Reading: 2624546889.xlsm
+[2026-04-28 14:47:24] [WARN ]   Iqama 2624546889 already in sheet. Adding new row anyway (config: warn).
+[2026-04-28 14:47:24] [ERROR]   ERROR processing 2624546889.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:24] [INFO ] Reading: 2624546988.xlsm
+[2026-04-28 14:47:27] [ERROR]   ERROR processing 2624546988.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:27] [INFO ] Reading: 2624821035.xlsm
+[2026-04-28 14:47:30] [ERROR]   ERROR processing 2624821035.xlsm: Specified cast is not valid.
+[2026-04-28 14:47:30] [INFO ] Saving tracker...
+[2026-04-28 14:47:33] [OK   ] Tracker saved.
+
