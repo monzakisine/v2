@@ -201,11 +201,39 @@ function ConvertTo-ColIndex {
 function Test-CellIsHighlighted {
     param($Cell)
     try {
-        $idx = $Cell.Interior.ColorIndex
+        if ($null -eq $Cell) { return $false }
+        
+        $interior = $Cell.Interior
+        if ($null -eq $interior) { return $false }
+        
+        # Try to safely read ColorIndex
+        $idx = $null
+        try {
+            $idx = $interior.ColorIndex
+        }
+        catch {
+            # If we can't read ColorIndex, try Color instead
+            try {
+                $color = $interior.Color
+                if ($color -eq 16777215) { return $false }  # white
+                return $true
+            }
+            catch {
+                return $false
+            }
+        }
+        
+        # Evaluate the ColorIndex
         if ($idx -eq -4142) { return $false }     # xlColorIndexNone
-        if ($idx -eq 0) { return $false }     # xlColorIndexAutomatic / treat as no fill
-        # Some templates use white fill; treat plain white as no fill
-        if ($Cell.Interior.Color -eq 16777215) { return $false }
+        if ($idx -eq 0)     { return $false }     # xlColorIndexAutomatic / treat as no fill
+        if ($idx -eq -2)    { return $false }     # xlAutomatic variant
+        
+        # Check if Color value is white (sometimes used as "no fill")
+        try {
+            if ($interior.Color -eq 16777215) { return $false }
+        }
+        catch { }
+        
         return $true
     }
     catch {
@@ -244,10 +272,32 @@ function Read-PatientFile {
                 Tests      = @{}
             }
 
+            # Safely read patient cells with error handling
             foreach ($k in $Cfg.PatientCells.Keys) {
-                $addr = $Cfg.PatientCells[$k]
-                $val = $sheet.Range($addr).Value2
-                $data[$k] = $val
+                try {
+                    $addr = $Cfg.PatientCells[$k]
+                    $cell = $sheet.Range($addr)
+                    
+                    # Check for error values (#N/A, #VALUE!, etc.)
+                    if ($null -eq $cell.Value2) {
+                        $data[$k] = $null
+                    }
+                    else {
+                        # Try to access the value; if it fails, leave it null
+                        $val = $null
+                        if ($cell.Value2 -is [System.DBNull]) {
+                            $val = $null
+                        }
+                        else {
+                            $val = $cell.Value2
+                        }
+                        $data[$k] = $val
+                    }
+                }
+                catch {
+                    Write-Log "    Warning: Could not read cell $addr for field '$k': $($_.Exception.Message)" 'WARN'
+                    $data[$k] = $null
+                }
             }
 
             if ($null -ne $data.Iqama) {
@@ -257,35 +307,56 @@ function Read-PatientFile {
                 $data.Name = ([string]$data.Name).Trim()
             }
 
+            # Detect status (which checkbox cell has a checkmark)
             $detectedStatus = $null
             foreach ($s in $Cfg.StatusCandidates) {
                 foreach ($addr in $s.CheckCells) {
-                    $cv = $sheet.Range($addr).Value2
-                    if ($null -ne $cv -and "$cv".Trim() -ne '') {
-                        $detectedStatus = $s.Label
-                        break
+                    try {
+                        $cell = $sheet.Range($addr)
+                        if ($null -ne $cell.Value2) {
+                            $cv = $cell.Value2
+                            if ($cv -is [System.DBNull]) {
+                                continue
+                            }
+                            if ("$cv".Trim() -ne '') {
+                                $detectedStatus = $s.Label
+                                break
+                            }
+                        }
+                    }
+                    catch {
+                        # Skip cells that error out
+                        continue
                     }
                 }
                 if ($detectedStatus) { break }
             }
             $data.Status = $detectedStatus
 
+            # Detect Abnormal tests via fill on column G
             foreach ($t in $Cfg.TestRowMap) {
-                $row = [int] $t.FormulaRow
+                try {
+                    $row = [int] $t.FormulaRow
 
-                if ($t.ContainsKey('MinAge') -and $null -ne $data.Age) {
-                    $ageInt = 0
-                    if ([int]::TryParse("$($data.Age)", [ref]$ageInt)) {
-                        if ($ageInt -lt [int]$t.MinAge) {
-                            $data.Tests[$t.TrackerCol] = $null
-                            continue
+                    # Skip tests with MinAge constraint if patient is younger
+                    if ($t.ContainsKey('MinAge') -and $null -ne $data.Age) {
+                        $ageInt = 0
+                        if ([int]::TryParse("$($data.Age)", [ref]$ageInt)) {
+                            if ($ageInt -lt [int]$t.MinAge) {
+                                $data.Tests[$t.TrackerCol] = $null
+                                continue
+                            }
                         }
                     }
-                }
 
-                $gCell = $sheet.Cells.Item($row, 7)
-                $isAbnormal = Test-CellIsHighlighted $gCell
-                $data.Tests[$t.TrackerCol] = if ($isAbnormal) { 'ABNORMAL' } else { 'NORMAL' }
+                    $gCell = $sheet.Cells.Item($row, 7)
+                    $isAbnormal = Test-CellIsHighlighted $gCell
+                    $data.Tests[$t.TrackerCol] = if ($isAbnormal) { 'ABNORMAL' } else { 'NORMAL' }
+                }
+                catch {
+                    Write-Log "    Warning: Could not read test row $($t.FormulaRow) for '$($t.TrackerCol)': $($_.Exception.Message)" 'WARN'
+                    $data.Tests[$t.TrackerCol] = 'NORMAL'  # Default to normal on error
+                }
             }
 
             return $data
