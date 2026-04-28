@@ -294,7 +294,7 @@ function Read-PatientFile {
     )
 
     Invoke-WithRetry {
-        $wb = $ExcelApp.Workbooks.Open($Path, $false, $true, , , , $false, , , $false, $false)
+        $wb = $ExcelApp.Workbooks.Open($Path, 0, $true)
         try {
             $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
 
@@ -554,7 +554,7 @@ $perCompanyStats = [ordered]@{}
 
 try {
     $Tracker = Invoke-WithRetry {
-        $Excel.Workbooks.Open($TrackerPath, $false, $false, , , , $false, , , $false, $false)
+        $Excel.Workbooks.Open($TrackerPath, 0, $false)
     }
 
     $companyIdx = 0
