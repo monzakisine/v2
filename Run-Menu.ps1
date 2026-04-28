@@ -9,7 +9,19 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+# Network-share fixes: unblock all .ps1 files + force Bypass for this process
+# so sub-scripts (Update-Tracker.ps1) don't trigger the "Run only scripts that
+# you trust" prompt every time.
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch { }
+try {
+    Get-ChildItem -Path $ScriptDir -Filter '*.ps1' -ErrorAction SilentlyContinue |
+        ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+} catch { }
+
 
 # Window appearance
 try {
@@ -91,6 +103,8 @@ $choice = Read-Host '  Your choice'
 $choice = $choice.Trim()
 
 $engineArgs = @()
+
+
 switch -Regex ($choice) {
     '^[Qq]$' {
         Write-Host '' ; Write-Host '  Goodbye!' -ForegroundColor DarkGray ; Start-Sleep -Seconds 1
@@ -98,18 +112,21 @@ switch -Regex ($choice) {
     }
     '^[Pp]$' {
         $engineArgs = @('all', '-DryRun')
+        break
     }
     '^0$' {
         $engineArgs = @('all')
+        break
     }
-    '^\d+$' {
+    '^[1-9]\d*$' {
         $idx = [int]$choice - 1
-        if ($idx -lt 0 -or $idx -ge $sortedKeys.Count) {
+        if ($idx -ge $sortedKeys.Count) {
             Write-Host '' ; Write-Host "  Invalid number. Quitting." -ForegroundColor Red
             $null = Read-Host '  Press Enter to close'
             exit 1
         }
         $engineArgs = @($sortedKeys[$idx])
+        break
     }
     default {
         Write-Host '' ; Write-Host "  Invalid choice. Quitting." -ForegroundColor Red
@@ -117,6 +134,7 @@ switch -Regex ($choice) {
         exit 1
     }
 }
+
 
 # Confirmation banner before launching the engine
 Show-Banner

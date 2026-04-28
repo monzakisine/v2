@@ -47,12 +47,43 @@ $ErrorActionPreference = 'Stop'
 # Helper: write to log file and console
 # ============================================================
 $Script:LogFile = $null
+$Script:LogStream = $null
+
+function Initialize-Log {
+    param([string] $Path)
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $Script:LogFile = $Path
+    # Hold the log file open with shared-read access for the whole run.
+    # This avoids antivirus / network-share locking races that happen when
+    # Add-Content reopens the file for every line.
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $Script:LogStream = New-Object System.IO.StreamWriter($fs, ([System.Text.UTF8Encoding]::new($false)))
+        $Script:LogStream.AutoFlush = $true
+    } catch {
+        $Script:LogStream = $null   # console-only fallback
+    }
+}
+
+function Close-Log {
+    if ($Script:LogStream) {
+        try { $Script:LogStream.Flush(); $Script:LogStream.Dispose() } catch { }
+        $Script:LogStream = $null
+    }
+}
+
 function Write-Log {
     param([string] $Message, [ValidateSet('INFO','WARN','ERROR','OK','DRY')] [string] $Level = 'INFO')
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line  = '[{0}] [{1,-5}] {2}' -f $stamp, $Level, $Message
-    if ($Script:LogFile) { Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8 }
-
+    if ($Script:LogStream) {
+        try { $Script:LogStream.WriteLine($line) }
+        catch {
+            Start-Sleep -Milliseconds 50
+            try { $Script:LogStream.WriteLine($line) } catch { }
+        }
+    }
     $color = switch ($Level) {
         'ERROR' { 'Red' }
         'WARN'  { 'Yellow' }
@@ -62,7 +93,6 @@ function Write-Log {
     }
     Write-Host $line -ForegroundColor $color
 }
-
 # ============================================================
 # Helper: convert column letter -> column index
 # ============================================================
@@ -275,7 +305,7 @@ foreach ($d in @($CompaniesDir, $ArchiveDir, $LogsDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
-$Script:LogFile = Join-Path $LogsDir ('run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date))
+Initialize-Log (Join-Path $LogsDir ('run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)))
 
 Write-Log '======================================================'
 Write-Log "AMC Automation start (Company='$Company', DryRun=$DryRun, NoArchive=$NoArchive)"
@@ -546,4 +576,5 @@ Write-Log '======================================================'
 Write-Log ("Done. Processed={0}  Skipped={1}  Errors={2}  Elapsed={3}" -f $totalProcessed, $totalSkipped, $totalErrors, $elapsedStr)
 Write-Log '======================================================'
 
+Close-Log
 if ($totalErrors -gt 0) { exit 1 } else { exit 0 }
