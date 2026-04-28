@@ -443,7 +443,29 @@ $keys = if ($Company.ToLower() -eq 'all') {
     }
     @($hit)
 }
-
+# Pre-flight: is the tracker already open in another Excel instance?
+# If yes, our Save() will silently go to a conflict copy.
+$lockProbe = $TrackerPath + '.amclock'
+$isLocked = $false
+try {
+    [System.IO.File]::Move($TrackerPath, $lockProbe)
+    [System.IO.File]::Move($lockProbe, $TrackerPath)
+} catch {
+    $isLocked = $true
+}
+if ($isLocked) {
+    Write-Host ''
+    Write-Host '  ============================================================' -ForegroundColor Red
+    Write-Host '  ERROR: The tracker file is currently LOCKED.' -ForegroundColor Red
+    Write-Host '  ============================================================' -ForegroundColor Red
+    Write-Host '  Someone (probably you, or another nurse) has the tracker' -ForegroundColor Red
+    Write-Host '  open in Excel right now. Any changes the script makes will' -ForegroundColor Red
+    Write-Host '  be lost or saved to a conflict copy.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host '  -> Close the tracker in Excel everywhere, then try again.' -ForegroundColor Yellow
+    Write-Host ''
+    exit 1
+}
 # Backup tracker
 if ($Cfg.BackupTrackerBeforeRun -and -not $DryRun) {
     $bkpDir = Join-Path $RootDir $Cfg.LogsDir
@@ -476,9 +498,37 @@ $startTime       = Get-Date
 $perCompanyStats = [ordered]@{}
 
 try {
+    # Notify=$false stops Excel from popping a "file in use" dialog and
+    # silently dropping us to read-only mode.
     $Tracker = Invoke-WithRetry -Label 'open tracker' -Action {
-        $Excel.Workbooks.Open($TrackerPath, $false, $false)
+        $Excel.Workbooks.Open(
+            $TrackerPath,   # Filename
+            $false,         # UpdateLinks
+            $false,         # ReadOnly
+            [Type]::Missing,# Format
+            [Type]::Missing,# Password
+            [Type]::Missing,# WriteResPassword
+            $true,          # IgnoreReadOnlyRecommended
+            [Type]::Missing,# Origin
+            [Type]::Missing,# Delimiter
+            $false          # Editable
+        )
     }
+
+    # CRITICAL: confirm we got a WRITABLE workbook, not a read-only copy
+    if ($Tracker.ReadOnly) {
+        throw "Tracker opened in READ-ONLY mode (another Excel instance has it). Close it everywhere and retry."
+    }
+
+    # CRITICAL: disable SharePoint AutoSave for our session.
+    # AutoSave intercepts Save() and can route it to a sync queue
+    # instead of immediately writing the file.
+    try { $Tracker.AutoSaveOn = $false } catch { }
+
+    # Diagnostic: show exactly which file Excel actually opened.
+    Write-Host ("  Opened: {0}" -f $Tracker.FullName) -ForegroundColor DarkGray
+    Write-Host ("  Read-only: {0}   AutoSave: {1}" -f $Tracker.ReadOnly, `
+        $(try { $Tracker.AutoSaveOn } catch { 'n/a' })) -ForegroundColor DarkGray
 
     $companyIdx   = 0
     $companyTotal = $keys.Count
@@ -602,11 +652,51 @@ try {
     if (-not $DryRun) {
         Write-Host ''
         Write-Host '  Saving tracker...' -ForegroundColor DarkGray
+
+        # Capture file size + timestamp BEFORE save
+        $beforeInfo = Get-Item $TrackerPath
+        $beforeTime = $beforeInfo.LastWriteTime
+        $beforeSize = $beforeInfo.Length
+
         try {
+            # Force xlOpenXMLWorkbookMacroEnabled (52) so macro-enabled .xlsm
+            # is preserved and we don't accidentally save to a converted format.
             Invoke-WithRetry -Label 'save tracker' -MaxAttempts 6 -InitialDelayMs 500 -Action {
                 $Tracker.Save()
             }
-            Write-Host '  Tracker saved.' -ForegroundColor Green
+
+            # Wait briefly for SharePoint sync to commit
+            Start-Sleep -Seconds 1
+
+            # VERIFY the file was actually changed on disk
+            $afterInfo = Get-Item $TrackerPath
+            if ($afterInfo.LastWriteTime -gt $beforeTime -or $afterInfo.Length -ne $beforeSize) {
+                Write-Host ("  Tracker saved.  ({0:N0} bytes -> {1:N0} bytes, modified {2:HH:mm:ss})" -f `
+                    $beforeSize, $afterInfo.Length, $afterInfo.LastWriteTime) -ForegroundColor Green
+            } else {
+                Write-Host '' -ForegroundColor Yellow
+                Write-Host '  WARNING: Save() returned but the file timestamp did NOT change!' -ForegroundColor Yellow
+                Write-Host '  This usually means SharePoint AutoSave intercepted the write.' -ForegroundColor Yellow
+                Write-Host '  Trying SaveAs as a fallback...' -ForegroundColor Yellow
+
+                # Fallback: explicit SaveAs with the macro-enabled format (52)
+                try {
+                    $Tracker.SaveAs($TrackerPath, 52)
+                    Start-Sleep -Seconds 1
+                    $afterInfo2 = Get-Item $TrackerPath
+                    if ($afterInfo2.LastWriteTime -gt $beforeTime) {
+                        Write-Host ("  SaveAs succeeded.  ({0:N0} bytes, modified {1:HH:mm:ss})" -f `
+                            $afterInfo2.Length, $afterInfo2.LastWriteTime) -ForegroundColor Green
+                    } else {
+                        Write-Host '  ERROR: Even SaveAs did not update the file!' -ForegroundColor Red
+                        Write-Host '  Check that you have write permission to the tracker folder.' -ForegroundColor Red
+                        $totalErrors++
+                    }
+                } catch {
+                    Write-Host "  ERROR: SaveAs also failed: $_" -ForegroundColor Red
+                    $totalErrors++
+                }
+            }
         } catch {
             Write-Host "  ERROR: Tracker save failed: $_" -ForegroundColor Red
             $totalErrors++
