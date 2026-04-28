@@ -294,7 +294,7 @@ function Read-PatientFile {
     )
 
     Invoke-WithRetry {
-        $wb = $ExcelApp.Workbooks.Open($Path, 0, $true)
+        $wb = $ExcelApp.Workbooks.Open($Path, [Type]::Missing, $true)
         try {
             $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
 
@@ -385,8 +385,11 @@ function Read-PatientFile {
             return $data
         }
         finally {
-            $wb.Close($false)
-            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb)
+            if ($null -ne $wb) {
+                try { $wb.Saved = $true } catch { }
+                try { $wb.Close($false) } catch { }
+                [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb)
+            }
             
             # Force GC to release the workbook handle
             [GC]::Collect()
@@ -448,7 +451,12 @@ function Write-TrackerRow {
 function Get-NextEmptyRow {
     param($Sheet)
     $row = 2
-    while ($null -ne $Sheet.Cells.Item($row, 1).Value2 -and "$($Sheet.Cells.Item($row, 1).Value2)".Trim() -ne '') {
+    while ($true) {
+        $cell = $Sheet.Cells.Item($row, 1)
+        $val = Get-SafeCellValue $cell
+        if ($null -eq $val -or "$val".Trim() -eq '') {
+            break
+        }
         $row++
     }
     return $row
@@ -461,9 +469,17 @@ function Test-IqamaExists {
     param($Sheet, [string] $Iqama)
     if ([string]::IsNullOrWhiteSpace($Iqama)) { return $false }
     $row = 2
-    while ($null -ne $Sheet.Cells.Item($row, 1).Value2 -and "$($Sheet.Cells.Item($row, 1).Value2)".Trim() -ne '') {
-        $existing = "$($Sheet.Cells.Item($row, 4).Value2)".Trim()       # column D = Iqama
-        if ($existing -eq $Iqama) { return $true }
+    while ($true) {
+        $cellA = $Sheet.Cells.Item($row, 1)
+        $valA = Get-SafeCellValue $cellA
+        if ($null -eq $valA -or "$valA".Trim() -eq '') {
+            break
+        }
+        
+        $cellD = $Sheet.Cells.Item($row, 4)
+        $existing = Get-SafeCellValue $cellD
+        if ($null -ne $existing -and "$existing".Trim() -eq $Iqama) { return $true }
+        
         $row++
     }
     return $false
@@ -554,7 +570,7 @@ $perCompanyStats = [ordered]@{}
 
 try {
     $Tracker = Invoke-WithRetry {
-        $Excel.Workbooks.Open($TrackerPath, 0, $false)
+        $Excel.Workbooks.Open($TrackerPath, [Type]::Missing, $false)
     }
 
     $companyIdx = 0
@@ -606,7 +622,8 @@ try {
             $nextSN = 1
         }
         else {
-            $prev = $sheet.Cells.Item($nextRow - 1, 1).Value2
+            $prevCell = $sheet.Cells.Item($nextRow - 1, 1)
+            $prev = Get-SafeCellValue $prevCell
             $nextSN = if ($prev -as [int]) { [int]$prev + 1 } else { $nextRow - 1 }
         }
         Write-Log "Next free row: $nextRow  (SN=$nextSN)  Files to process: $($files.Count)"
@@ -742,6 +759,7 @@ catch {
 }
 finally {
     if ($Tracker) {
+        try { $Tracker.Saved = $true } catch { }
         try { $Tracker.Close($false) } catch { }
         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($Tracker)
     }
