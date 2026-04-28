@@ -225,8 +225,8 @@ function Test-CellIsHighlighted {
         
         # Evaluate the ColorIndex
         if ($idx -eq -4142) { return $false }     # xlColorIndexNone
-        if ($idx -eq 0)     { return $false }     # xlColorIndexAutomatic / treat as no fill
-        if ($idx -eq -2)    { return $false }     # xlAutomatic variant
+        if ($idx -eq 0) { return $false }     # xlColorIndexAutomatic / treat as no fill
+        if ($idx -eq -2) { return $false }     # xlAutomatic variant
         
         # Check if Color value is white (sometimes used as "no fill")
         try {
