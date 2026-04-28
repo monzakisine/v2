@@ -9,6 +9,12 @@
     comment, then writes a new row to the matching company sheet in
     Contractors_AMC_Tracker_2026.xlsm. Processed files are moved to
     <RootDir>\Archive\<CompanyName>\.
+    
+    ROBUST FILE-LOCKING FIX:
+    - Logs written to local %TEMP% during run (immune to AV scanning)
+    - All file operations retry with exponential backoff (250ms → 4s, up to 6 attempts)
+    - Forced GC + delay between closing Excel handles and moving files
+    - Network log copy fails gracefully; local log path printed as fallback
 
 .PARAMETER Company
     Company key as defined in config.psd1 (e.g. 'scms', 'altamimi'),
@@ -44,54 +50,135 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# Helper: write to log file and console
+# RETRY WRAPPER: exponential backoff for network-share resilience
+# ============================================================
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $ScriptBlock,
+        [int] $MaxAttempts = 6,
+        [int] $InitialDelayMs = 250
+    )
+    
+    $attempt = 0
+    $delayMs = $InitialDelayMs
+    
+    while ($attempt -lt $MaxAttempts) {
+        $attempt++
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            if ($attempt -ge $MaxAttempts) {
+                throw
+            }
+            Write-Log "  [Retry $attempt/$MaxAttempts] Waiting ${delayMs}ms before retry: $($_.Exception.Message)" 'WARN'
+            Start-Sleep -Milliseconds $delayMs
+            $delayMs = [Math]::Min($delayMs * 2, 4000)  # cap at 4 seconds
+        }
+    }
+}
+
+# ============================================================
+# Log to local %TEMP%, will be copied to network at the end
 # ============================================================
 $Script:LogFile = $null
+$Script:LocalLogPath = $null
+$Script:NetworkLogPath = $null
 $Script:LogStream = $null
 
 function Initialize-Log {
-    param([string] $Path)
-    $dir = Split-Path -Parent $Path
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $Script:LogFile = $Path
-    # Hold the log file open with shared-read access for the whole run.
-    # This avoids antivirus / network-share locking races that happen when
-    # Add-Content reopens the file for every line.
-    try {
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    param([string] $NetworkPath)
+    
+    # Ensure network log dir exists
+    $networkDir = Split-Path -Parent $NetworkPath
+    Invoke-WithRetry {
+        if (-not (Test-Path $networkDir)) {
+            New-Item -ItemType Directory -Path $networkDir -Force | Out-Null
+        }
+    }
+    
+    # Create log in local %TEMP% (AV doesn't scan it aggressively)
+    $localDir = Join-Path $env:TEMP 'AMCLogs'
+    Invoke-WithRetry {
+        if (-not (Test-Path $localDir)) {
+            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+        }
+    }
+    
+    $logFileName = 'run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)
+    $Script:LocalLogPath = Join-Path $localDir $logFileName
+    $Script:NetworkLogPath = $NetworkPath
+    
+    # Open local log file with StreamWriter for persistent handle
+    Invoke-WithRetry {
+        $fs = [System.IO.File]::Open($Script:LocalLogPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
         $Script:LogStream = New-Object System.IO.StreamWriter($fs, ([System.Text.UTF8Encoding]::new($false)))
         $Script:LogStream.AutoFlush = $true
-    } catch {
-        $Script:LogStream = $null   # console-only fallback
     }
+    
+    $Script:LogFile = $Script:LocalLogPath
 }
 
 function Close-Log {
     if ($Script:LogStream) {
-        try { $Script:LogStream.Flush(); $Script:LogStream.Dispose() } catch { }
+        try {
+            $Script:LogStream.Flush()
+            $Script:LogStream.Dispose()
+        }
+        catch { }
         $Script:LogStream = $null
     }
 }
 
 function Write-Log {
-    param([string] $Message, [ValidateSet('INFO','WARN','ERROR','OK','DRY')] [string] $Level = 'INFO')
+    param(
+        [string] $Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'DRY')] [string] $Level = 'INFO'
+    )
+    
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line  = '[{0}] [{1,-5}] {2}' -f $stamp, $Level, $Message
+    $line = '[{0}] [{1,-5}] {2}' -f $stamp, $Level, $Message
+    
     if ($Script:LogStream) {
-        try { $Script:LogStream.WriteLine($line) }
+        try {
+            $Script:LogStream.WriteLine($line)
+        }
         catch {
             Start-Sleep -Milliseconds 50
             try { $Script:LogStream.WriteLine($line) } catch { }
         }
     }
+    
     $color = switch ($Level) {
         'ERROR' { 'Red' }
-        'WARN'  { 'Yellow' }
-        'OK'    { 'Green' }
-        'DRY'   { 'Cyan' }
+        'WARN' { 'Yellow' }
+        'OK' { 'Green' }
+        'DRY' { 'Cyan' }
         default { 'Gray' }
     }
     Write-Host $line -ForegroundColor $color
+}
+
+function Copy-LogToNetwork {
+    # Best-effort copy: if network copy fails, at least print where the local log is
+    try {
+        Invoke-WithRetry {
+            $networkDir = Split-Path -Parent $Script:NetworkLogPath
+            if (-not (Test-Path $networkDir)) {
+                New-Item -ItemType Directory -Path $networkDir -Force | Out-Null
+            }
+            Copy-Item -Path $Script:LocalLogPath -Destination $Script:NetworkLogPath -Force
+        }
+        Write-Log "Log copied to network: $Script:NetworkLogPath" 'OK'
+        return $Script:NetworkLogPath
+    }
+    catch {
+        Write-Log "WARNING: Could not copy log to network ($($_.Exception.Message))" 'WARN'
+        Write-Log "Local log path: $Script:LocalLogPath" 'WARN'
+        Write-Host ""
+        Write-Host "  ⚠️  Local log fallback: $Script:LocalLogPath" -ForegroundColor Yellow
+        return $Script:LocalLogPath
+    }
 }
 # ============================================================
 # Helper: convert column letter -> column index
@@ -116,17 +203,18 @@ function Test-CellIsHighlighted {
     try {
         $idx = $Cell.Interior.ColorIndex
         if ($idx -eq -4142) { return $false }     # xlColorIndexNone
-        if ($idx -eq 0)     { return $false }     # xlColorIndexAutomatic / treat as no fill
+        if ($idx -eq 0) { return $false }     # xlColorIndexAutomatic / treat as no fill
         # Some templates use white fill; treat plain white as no fill
         if ($Cell.Interior.Color -eq 16777215) { return $false }
         return $true
-    } catch {
+    }
+    catch {
         return $false
     }
 }
 
 # ============================================================
-# Helper: read the filled patient file and return a hashtable
+# Helper: read the filled patient file with retries
 # ============================================================
 function Read-PatientFile {
     param(
@@ -135,79 +223,82 @@ function Read-PatientFile {
         [Parameter(Mandatory)] [hashtable] $Cfg
     )
 
-    $wb = $ExcelApp.Workbooks.Open($Path, $false, $true)   # ReadOnly = $true
-    try {
-        $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
+    Invoke-WithRetry {
+        $wb = $ExcelApp.Workbooks.Open($Path, $false, $true)
+        try {
+            $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
 
-        $data = [ordered]@{
-            SourceFile  = $Path
-            Name        = $null
-            Company     = $null
-            Iqama       = $null
-            Age         = $null
-            DateAMC     = $null
-            DateReview  = $null
-            BloodPress  = $null
-            Height      = $null
-            Weight      = $null
-            Status      = $null
-            Comment     = $null
-            Tests       = @{}
-        }
-
-        foreach ($k in $Cfg.PatientCells.Keys) {
-            $addr = $Cfg.PatientCells[$k]
-            $val  = $sheet.Range($addr).Value2
-            $data[$k] = $val
-        }
-
-        # Iqama should always be a STRING (long numbers lose precision as float)
-        if ($null -ne $data.Iqama) {
-            $data.Iqama = ([string]$data.Iqama).Trim()
-        }
-        if ($null -ne $data.Name) {
-            $data.Name = ([string]$data.Name).Trim()
-        }
-
-        # Detect status (which checkbox cell has a checkmark)
-        $detectedStatus = $null
-        foreach ($s in $Cfg.StatusCandidates) {
-            foreach ($addr in $s.CheckCells) {
-                $cv = $sheet.Range($addr).Value2
-                if ($null -ne $cv -and "$cv".Trim() -ne '') {
-                    $detectedStatus = $s.Label
-                    break
-                }
+            $data = [ordered]@{
+                SourceFile = $Path
+                Name       = $null
+                Company    = $null
+                Iqama      = $null
+                Age        = $null
+                DateAMC    = $null
+                DateReview = $null
+                BloodPress = $null
+                Height     = $null
+                Weight     = $null
+                Status     = $null
+                Comment    = $null
+                Tests      = @{}
             }
-            if ($detectedStatus) { break }
-        }
-        $data.Status = $detectedStatus
 
-        # Detect Abnormal tests via fill on column G of each row
-        foreach ($t in $Cfg.TestRowMap) {
-            $row  = [int] $t.FormulaRow
+            foreach ($k in $Cfg.PatientCells.Keys) {
+                $addr = $Cfg.PatientCells[$k]
+                $val = $sheet.Range($addr).Value2
+                $data[$k] = $val
+            }
 
-            # Skip tests that have a MinAge constraint when the patient
-            # is younger than that (e.g. PSA only for age >= 40).
-            if ($t.ContainsKey('MinAge') -and $null -ne $data.Age) {
-                $ageInt = 0
-                if ([int]::TryParse("$($data.Age)", [ref]$ageInt)) {
-                    if ($ageInt -lt [int]$t.MinAge) {
-                        $data.Tests[$t.TrackerCol] = $null   # leave blank in tracker
-                        continue
+            if ($null -ne $data.Iqama) {
+                $data.Iqama = ([string]$data.Iqama).Trim()
+            }
+            if ($null -ne $data.Name) {
+                $data.Name = ([string]$data.Name).Trim()
+            }
+
+            $detectedStatus = $null
+            foreach ($s in $Cfg.StatusCandidates) {
+                foreach ($addr in $s.CheckCells) {
+                    $cv = $sheet.Range($addr).Value2
+                    if ($null -ne $cv -and "$cv".Trim() -ne '') {
+                        $detectedStatus = $s.Label
+                        break
                     }
                 }
+                if ($detectedStatus) { break }
+            }
+            $data.Status = $detectedStatus
+
+            foreach ($t in $Cfg.TestRowMap) {
+                $row = [int] $t.FormulaRow
+
+                if ($t.ContainsKey('MinAge') -and $null -ne $data.Age) {
+                    $ageInt = 0
+                    if ([int]::TryParse("$($data.Age)", [ref]$ageInt)) {
+                        if ($ageInt -lt [int]$t.MinAge) {
+                            $data.Tests[$t.TrackerCol] = $null
+                            continue
+                        }
+                    }
+                }
+
+                $gCell = $sheet.Cells.Item($row, 7)
+                $isAbnormal = Test-CellIsHighlighted $gCell
+                $data.Tests[$t.TrackerCol] = if ($isAbnormal) { 'ABNORMAL' } else { 'NORMAL' }
             }
 
-            $gCell = $sheet.Cells.Item($row, 7)        # column G ("Abnormal" cell)
-            $isAbnormal = Test-CellIsHighlighted $gCell
-            $data.Tests[$t.TrackerCol] = if ($isAbnormal) { 'ABNORMAL' } else { 'NORMAL' }
+            return $data
         }
-
-        return $data
-    } finally {
-        $wb.Close($false)
-        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb)
+        finally {
+            $wb.Close($false)
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb)
+            
+            # Force GC to release the workbook handle
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+        }
     }
 }
 
@@ -226,27 +317,27 @@ function Write-TrackerRow {
     $fc = $Cfg.FixedColumns
 
     $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.SerialNumber)).Value2 = $SerialNumber
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateAMC)).Value2     = $Patient.DateAMC
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateReview)).Value2  = $Patient.DateReview
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateAMC)).Value2 = $Patient.DateAMC
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.DateReview)).Value2 = $Patient.DateReview
 
     # Iqama: write as text to preserve full digit precision
     $iqamaCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Iqama))
     $iqamaCell.NumberFormat = '@'
     $iqamaCell.Value2 = $Patient.Iqama
 
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Name)).Value2       = $Patient.Name
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Company)).Value2    = $Patient.Company
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Height)).Value2     = $Patient.Height
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Weight)).Value2     = $Patient.Weight
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Name)).Value2 = $Patient.Name
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Company)).Value2 = $Patient.Company
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Height)).Value2 = $Patient.Height
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Weight)).Value2 = $Patient.Weight
 
     # BMI as a live formula
     $bmiCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.BMIFormula))
     $bmiCell.Formula = '=J{0}/(I{0}/100)^2' -f $RowIndex
 
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Age)).Value2        = $Patient.Age
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Age)).Value2 = $Patient.Age
     $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.BloodPress)).Value2 = $Patient.BloodPress
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Status)).Value2     = $Patient.Status
-    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Comment)).Value2    = $Patient.Comment
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Status)).Value2 = $Patient.Status
+    $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Comment)).Value2 = $Patient.Comment
 
     # Test result columns
     foreach ($col in @($Patient.Tests.Keys)) {
@@ -288,23 +379,27 @@ function Test-IqamaExists {
 #                          M A I N
 # ============================================================
 
-# Locate config
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'config.psd1' }
 if (-not (Test-Path $ConfigPath)) { throw "Config file not found: $ConfigPath" }
 $Cfg = Import-PowerShellDataFile $ConfigPath
 
-# Resolve absolute paths
-$RootDir      = $Cfg.RootDir
-$TrackerPath  = Join-Path $RootDir $Cfg.TrackerRelPath
+$RootDir = $Cfg.RootDir
+$TrackerPath = Join-Path $RootDir $Cfg.TrackerRelPath
 $CompaniesDir = Join-Path $RootDir $Cfg.CompaniesDir
-$ArchiveDir   = Join-Path $RootDir $Cfg.ArchiveDir
-$LogsDir      = Join-Path $RootDir $Cfg.LogsDir
+$ArchiveDir = Join-Path $RootDir $Cfg.ArchiveDir
+$LogsDir = Join-Path $RootDir $Cfg.LogsDir
 
+# Ensure all network dirs exist (with retry)
 foreach ($d in @($CompaniesDir, $ArchiveDir, $LogsDir)) {
-    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    Invoke-WithRetry {
+        if (-not (Test-Path $d)) {
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+        }
+    }
 }
 
+# Initialize local log (will be copied to network at end)
 Initialize-Log (Join-Path $LogsDir ('run-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)))
 
 Write-Log '======================================================'
@@ -315,46 +410,51 @@ Write-Log '======================================================'
 
 if (-not (Test-Path $TrackerPath)) {
     Write-Log "Tracker file not found: $TrackerPath" 'ERROR'
+    Close-Log
+    Copy-LogToNetwork
     exit 1
 }
 
-# Resolve which company keys to process
 $AllKeys = $Cfg.Companies.Keys | Sort-Object
 $keys = if ($Company.ToLower() -eq 'all') {
     $AllKeys
-} else {
+}
+else {
     $hit = $AllKeys | Where-Object { $_ -ieq $Company }
     if (-not $hit) {
         Write-Log "Unknown company key '$Company'. Valid keys: $($AllKeys -join ', ')" 'ERROR'
+        Close-Log
+        Copy-LogToNetwork
         exit 1
     }
     @($hit)
 }
 
-# Backup tracker
+# Backup tracker (with retry)
 if ($Cfg.BackupTrackerBeforeRun -and -not $DryRun) {
     $bkp = Join-Path $LogsDir ('tracker-backup-{0:yyyy-MM-dd_HHmmss}.xlsm' -f (Get-Date))
-    Copy-Item -Path $TrackerPath -Destination $bkp
+    Invoke-WithRetry {
+        Copy-Item -Path $TrackerPath -Destination $bkp
+    }
     Write-Log "Tracker backup -> $bkp"
 }
 
-# Spin up Excel
 Write-Log 'Launching Excel (hidden)...'
 $Excel = New-Object -ComObject Excel.Application
-$Excel.Visible        = $false
-$Excel.DisplayAlerts  = $false
+$Excel.Visible = $false
+$Excel.DisplayAlerts = $false
 $Excel.AskToUpdateLinks = $false
-try { $Excel.AutomationSecurity = 3 } catch { } # msoAutomationSecurityForceDisable
+try { $Excel.AutomationSecurity = 3 } catch { }
 
 $Tracker = $null
 $totalProcessed = 0
-$totalSkipped   = 0
-$totalErrors    = 0
-$startTime      = Get-Date
-$perCompanyStats = [ordered]@{}    # for the final summary table
+$totalSkipped = 0
+$totalErrors = 0
+$startTime = Get-Date
+$perCompanyStats = [ordered]@{}
 
 try {
-    $Tracker = $Excel.Workbooks.Open($TrackerPath, $false, $false)
+    $Tracker = Invoke-WithRetry { $Excel.Workbooks.Open($TrackerPath, $false, $false) }
 
     $companyIdx = 0
     $companyTotal = $keys.Count
@@ -362,7 +462,7 @@ try {
     foreach ($key in $keys) {
         $companyIdx++
         $info = $Cfg.Companies[$key]
-        $sheetName  = $info.Sheet
+        $sheetName = $info.Sheet
         $folderName = $info.Folder
         $folderPath = Join-Path $CompaniesDir $folderName
 
@@ -379,7 +479,9 @@ try {
 
         if (-not (Test-Path $folderPath)) {
             Write-Log "Folder missing, creating: $folderPath" 'WARN'
-            New-Item -ItemType Directory -Path $folderPath -Force | Out-Null
+            Invoke-WithRetry {
+                New-Item -ItemType Directory -Path $folderPath -Force | Out-Null
+            }
             continue
         }
 
@@ -401,7 +503,8 @@ try {
         $nextRow = Get-NextEmptyRow $sheet
         if ($nextRow -eq 2) {
             $nextSN = 1
-        } else {
+        }
+        else {
             $prev = $sheet.Cells.Item($nextRow - 1, 1).Value2
             $nextSN = if ($prev -as [int]) { [int]$prev + 1 } else { $nextRow - 1 }
         }
@@ -454,7 +557,8 @@ try {
                     Write-Log "  DRY-RUN row=$nextRow SN=$nextSN  $($patient.Name) | Iqama=$($patient.Iqama) | Age=$($patient.Age) | BP=$($patient.BloodPress) | Status=$($patient.Status) | Abnormal=$abn" 'DRY'
                     $totalProcessed++
                     $coStats.Written++
-                } else {
+                }
+                else {
                     Write-TrackerRow -Sheet $sheet -RowIndex $nextRow -SerialNumber $nextSN -Patient $patient -Cfg $Cfg
                     Write-Log "  WROTE row=$nextRow SN=$nextSN  $($patient.Name) ($($patient.Iqama)) status=$($patient.Status)" 'OK'
                     $totalProcessed++
@@ -462,25 +566,44 @@ try {
 
                     if (-not $NoArchive) {
                         $archiveCo = Join-Path $ArchiveDir $folderName
-                        if (-not (Test-Path $archiveCo)) { New-Item -ItemType Directory -Path $archiveCo -Force | Out-Null }
+                        Invoke-WithRetry {
+                            if (-not (Test-Path $archiveCo)) {
+                                New-Item -ItemType Directory -Path $archiveCo -Force | Out-Null
+                            }
+                        }
 
                         $base = [IO.Path]::GetFileNameWithoutExtension($file.Name)
-                        $ext  = $file.Extension
+                        $ext = $file.Extension
                         $dest = Join-Path $archiveCo $file.Name
-                        if (Test-Path $dest) {
-                            $dest = Join-Path $archiveCo ('{0}_{1:yyyyMMdd-HHmmss}{2}' -f $base, (Get-Date), $ext)
+                        
+                        Invoke-WithRetry {
+                            if (Test-Path $dest) {
+                                $dest = Join-Path $archiveCo ('{0}_{1:yyyyMMdd-HHmmss}{2}' -f $base, (Get-Date), $ext)
+                            }
                         }
-                        Move-Item -Path $file.FullName -Destination $dest
+
+                        # Force GC + delay before moving to allow Excel to fully release the handle
+                        [GC]::Collect()
+                        [GC]::WaitForPendingFinalizers()
+                        [GC]::Collect()
+                        Start-Sleep -Milliseconds 500
+                        
+                        Invoke-WithRetry {
+                            Move-Item -Path $file.FullName -Destination $dest
+                        }
                         Write-Log "  Archived xlsm -> $dest"
 
-                        # Move matching PDF if present (same basename, .pdf)
+                        # Move matching PDF if present
                         $pdfSrc = Join-Path $folderPath "$base.pdf"
                         if (Test-Path $pdfSrc) {
                             $pdfDest = Join-Path $archiveCo "$base.pdf"
-                            if (Test-Path $pdfDest) {
-                                $pdfDest = Join-Path $archiveCo ('{0}_{1:yyyyMMdd-HHmmss}.pdf' -f $base, (Get-Date))
+                            
+                            Invoke-WithRetry {
+                                if (Test-Path $pdfDest) {
+                                    $pdfDest = Join-Path $archiveCo ('{0}_{1:yyyyMMdd-HHmmss}.pdf' -f $base, (Get-Date))
+                                }
+                                Move-Item -Path $pdfSrc -Destination $pdfDest
                             }
-                            Move-Item -Path $pdfSrc -Destination $pdfDest
                             Write-Log "  Archived pdf  -> $pdfDest"
                         }
                     }
@@ -488,7 +611,8 @@ try {
                     $nextRow++
                     $nextSN++
                 }
-            } catch {
+            }
+            catch {
                 Write-Log "  ERROR processing $($file.Name): $_" 'ERROR'
                 $totalErrors++
                 $coStats.Errors++
@@ -502,15 +626,20 @@ try {
 
     if (-not $DryRun) {
         Write-Log 'Saving tracker...'
-        $Tracker.Save()
+        Invoke-WithRetry {
+            $Tracker.Save()
+        }
         Write-Log 'Tracker saved.' 'OK'
-    } else {
+    }
+    else {
         Write-Log 'DRY-RUN: tracker not modified.' 'DRY'
     }
-} catch {
+}
+catch {
     Write-Log "FATAL: $_" 'ERROR'
     $totalErrors++
-} finally {
+}
+finally {
     if ($Tracker) {
         try { $Tracker.Close($false) } catch { }
         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($Tracker)
@@ -519,6 +648,8 @@ try {
         try { $Excel.Quit() } catch { }
         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($Excel)
     }
+    
+    # Final aggressive GC to ensure all handles released
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
     [GC]::Collect()
@@ -535,20 +666,20 @@ Write-Host ''
 
 if ($DryRun) {
     Write-Host '   Mode:                  ' -NoNewline; Write-Host 'DRY-RUN (no changes written)' -ForegroundColor Yellow
-} else {
+}
+else {
     Write-Host '   Mode:                  ' -NoNewline; Write-Host 'LIVE (tracker updated)' -ForegroundColor Green
 }
 Write-Host ('   Companies scanned:     {0}' -f $keys.Count)
-Write-Host ('   Patient files written: {0}' -f $totalProcessed) -ForegroundColor $(if ($totalProcessed -gt 0) {'Green'} else {'Gray'})
-Write-Host ('   Files skipped:         {0}' -f $totalSkipped)  -ForegroundColor $(if ($totalSkipped  -gt 0) {'Yellow'} else {'Gray'})
-Write-Host ('   Errors:                {0}' -f $totalErrors)   -ForegroundColor $(if ($totalErrors   -gt 0) {'Red'} else {'Gray'})
+Write-Host ('   Patient files written: {0}' -f $totalProcessed) -ForegroundColor $(if ($totalProcessed -gt 0) { 'Green' } else { 'Gray' })
+Write-Host ('   Files skipped:         {0}' -f $totalSkipped)  -ForegroundColor $(if ($totalSkipped -gt 0) { 'Yellow' } else { 'Gray' })
+Write-Host ('   Errors:                {0}' -f $totalErrors)   -ForegroundColor $(if ($totalErrors -gt 0) { 'Red' } else { 'Gray' })
 Write-Host ('   Time elapsed:          {0}' -f $elapsedStr)
 Write-Host ''
 
-# Per-company breakdown table
 $rowsWithActivity = @($perCompanyStats.GetEnumerator() | Where-Object {
-    $_.Value.Written -gt 0 -or $_.Value.Skipped -gt 0 -or $_.Value.Errors -gt 0
-})
+        $_.Value.Written -gt 0 -or $_.Value.Skipped -gt 0 -or $_.Value.Errors -gt 0
+    })
 if ($rowsWithActivity.Count -gt 0) {
     Write-Host '   Per-company breakdown:' -ForegroundColor White
     Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f 'Company', 'Written', 'Skipped', 'Errors') -ForegroundColor DarkGray
@@ -564,10 +695,13 @@ if ($rowsWithActivity.Count -gt 0) {
     Write-Host ''
 }
 
+# Determine final log path (network or local fallback)
+$finalLogPath = Copy-LogToNetwork
+
 Write-Host '   Tracker:  ' -NoNewline -ForegroundColor DarkGray
 Write-Host $TrackerPath -ForegroundColor Gray
 Write-Host '   Log file: ' -NoNewline -ForegroundColor DarkGray
-Write-Host $Script:LogFile -ForegroundColor Gray
+Write-Host $finalLogPath -ForegroundColor Gray
 Write-Host '  ============================================================' -ForegroundColor Cyan
 Write-Host ''
 
@@ -577,4 +711,5 @@ Write-Log ("Done. Processed={0}  Skipped={1}  Errors={2}  Elapsed={3}" -f $total
 Write-Log '======================================================'
 
 Close-Log
+
 if ($totalErrors -gt 0) { exit 1 } else { exit 0 }
