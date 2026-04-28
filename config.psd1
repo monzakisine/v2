@@ -78,11 +78,12 @@
     # Status (Fit / Unfit / Clinic Visit / Further Evaluation)
     # The script will check each candidate cell beside the label.
     # Whichever cell has a non-empty value (the checkmark) wins.
+    # VBA puts ChrW(10003) = ✓ into column I only (I4:I7)
     StatusCandidates = @(
-        @{ Label = 'FIT';                    CheckCells = @('H4','I4','F4') }
-        @{ Label = 'UNFIT';                  CheckCells = @('H5','I5','F5') }
-        @{ Label = 'CLINIC VISIT';           CheckCells = @('H6','I6','F6') }
-        @{ Label = 'FOR FURTHER EVALUATION'; CheckCells = @('I7','H7','F7') }
+        @{ Label = 'FIT';                    CheckCell = 'I4' }
+        @{ Label = 'UNFIT';                  CheckCell = 'I5' }
+        @{ Label = 'CLINIC VISIT';           CheckCell = 'I6' }
+        @{ Label = 'FOR FURTHER EVALUATION'; CheckCell = 'I7' }
     )
 
     # Test result cells in the formula (column where doctor adds
