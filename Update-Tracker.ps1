@@ -55,29 +55,21 @@ function Get-SafeValue {
     param($RawValue)
     if ($null -eq $RawValue) { return $null }
     try {
-        # String cells - return as-is
         if ($RawValue -is [string]) { return $RawValue.Trim() }
+        if ($RawValue -is [bool])   { return $RawValue }
+        if ($RawValue -is [datetime]) { return $RawValue }
 
-        # Boolean cells
-        if ($RawValue -is [bool]) { return $RawValue }
-
-        # Numeric (including dates stored as doubles, and large iqamas)
-        # Force through [double] to avoid Int32 overflow cast errors
+        # Numerics: route through Double to avoid Int32 overflow on large
+        # Iqama numbers. Return as Double so Excel preserves date formatting,
+        # decimals, etc. The caller (Write-TrackerRow) decides if it needs
+        # a string version (only for Iqama).
         $d = [double]$RawValue
-        # Excel error codes are negative numbers like -2146826281
-        if ($d -lt -999999) { return $null }
-        # If it looks like a whole number, return as string (preserves Iqama precision)
-        if ($d -eq [Math]::Floor($d)) {
-            # Use [long] not [int] - Iqama numbers exceed Int32
-            return ([long]$d).ToString()
-        }
+        if ($d -lt -999999) { return $null }   # Excel error sentinel
         return $d
     } catch {
-        # Absolute fallback - just stringify whatever came back
         try { return [string]$RawValue } catch { return $null }
     }
 }
-
 # ============================================================
 # SAFE INTERIOR COLOR CHECK
 # Returns $true if the cell has a non-default fill colour.
@@ -254,30 +246,59 @@ function Write-TrackerRow {
     )
     $fc = $Cfg.FixedColumns
 
-    # Helper: write to a cell safely (never throws on a single cell)
-    $w = {
-        param($col, $val)
-        try { $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $val } catch { }
+    # Iqama goes in as TEXT (preserves all 10 digits + leading zeros)
+    $iqamaStr = $null
+    if ($null -ne $Patient.Iqama) {
+        if ($Patient.Iqama -is [double]) {
+            $iqamaStr = ([long]$Patient.Iqama).ToString()
+        } else {
+            $iqamaStr = ([string]$Patient.Iqama).Trim()
+        }
     }
 
-    & $w $fc.SerialNumber $SerialNumber
-    & $w $fc.DateAMC      $Patient.DateAMC
-    & $w $fc.DateReview   $Patient.DateReview
-    & $w $fc.Name         $Patient.Name
-    & $w $fc.Company      $Patient.Company
-    & $w $fc.Height       $Patient.Height
-    & $w $fc.Weight       $Patient.Weight
-    & $w $fc.Age          $Patient.Age
-    & $w $fc.BloodPress   $Patient.BloodPress
-    & $w $fc.Status       $Patient.Status
-    & $w $fc.Comment      $Patient.Comment
+    # Direct writes — no script block, no scope tricks. Each cell wrapped
+    # in its own try so one bad cell can't break the whole row.
+    $writes = @(
+        @{ Col = $fc.SerialNumber; Val = $SerialNumber;          AsText = $false }
+        @{ Col = $fc.DateAMC;      Val = $Patient.DateAMC;       AsText = $false }
+        @{ Col = $fc.DateReview;   Val = $Patient.DateReview;    AsText = $false }
+        @{ Col = $fc.Iqama;        Val = $iqamaStr;              AsText = $true  }
+        @{ Col = $fc.Name;         Val = $Patient.Name;          AsText = $false }
+        @{ Col = $fc.Company;      Val = $Patient.Company;       AsText = $false }
+        @{ Col = $fc.Height;       Val = $Patient.Height;        AsText = $false }
+        @{ Col = $fc.Weight;       Val = $Patient.Weight;        AsText = $false }
+        @{ Col = $fc.Age;          Val = $Patient.Age;           AsText = $false }
+        @{ Col = $fc.BloodPress;   Val = $Patient.BloodPress;    AsText = $false }
+        @{ Col = $fc.Status;       Val = $Patient.Status;        AsText = $false }
+        @{ Col = $fc.Comment;      Val = $Patient.Comment;       AsText = $false }
+    )
 
-    # Iqama must be stored as TEXT to keep all 10 digits
-    try {
-        $iqCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Iqama))
-        $iqCell.NumberFormat = '@'
-        $iqCell.Value2 = $Patient.Iqama
-    } catch { }
+    $writeFails = 0
+    foreach ($w in $writes) {
+        if ($null -eq $w.Val) { continue }
+        try {
+            $cell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $w.Col))
+            if ($w.AsText) { $cell.NumberFormat = '@' }
+            $cell.Value2 = $w.Val
+        } catch {
+            $writeFails++
+            Write-Host ("           cell-write FAILED  col={0}  val={1}  err={2}" -f `
+                $w.Col, $w.Val, $_.Exception.Message) -ForegroundColor Magenta
+        }
+    }
+
+    # Test result columns
+    foreach ($col in @($Patient.Tests.Keys)) {
+        $val = $Patient.Tests[$col]
+        if ($null -eq $val) { continue }
+        try {
+            $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $val
+        } catch {
+            $writeFails++
+            Write-Host ("           cell-write FAILED  col={0}  val={1}  err={2}" -f `
+                $col, $val, $_.Exception.Message) -ForegroundColor Magenta
+        }
+    }
 
     # BMI formula
     try {
@@ -285,15 +306,10 @@ function Write-TrackerRow {
             ('=J{0}/(I{0}/100)^2' -f $RowIndex)
     } catch { }
 
-    # Test result columns
-    foreach ($col in @($Patient.Tests.Keys)) {
-        $val = $Patient.Tests[$col]
-        if ($null -ne $val) {
-            try { $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $val } catch { }
-        }
+    if ($writeFails -gt 0) {
+        Write-Host ("           {0} cell write(s) failed in row {1}" -f $writeFails, $RowIndex) -ForegroundColor Yellow
     }
 }
-
 # ============================================================
 # Find next empty row (column A = serial number, starts row 2)
 # ============================================================
