@@ -20,7 +20,29 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
+# ============================================================
+# PRE-CACHE: Forces SharePoint/OneDrive to download the file
+# locally before Excel tries to open it. Without this, the
+# Windows "Downloading..." blue bar appears mid-run and can
+# cause a brief lock race on the first open attempt.
+# ============================================================
+function Invoke-PreCache {
+    param([string] $Path)
+    try {
+        # Reading a few bytes forces the sync client to fully
+        # download the file to the local cache before we proceed.
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+              [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $buf = New-Object byte[] 512
+        [void]$fs.Read($buf, 0, $buf.Length)
+        $fs.Close()
+        $fs.Dispose()
+        Start-Sleep -Milliseconds 100
+    } catch {
+        # If pre-cache fails, just continue - Excel will trigger
+        # the download itself (slower but still works)
+    }
+}
 # ============================================================
 # SAFE VALUE READER
 # Excel COM returns cell values as untyped VARIANTs.
@@ -148,6 +170,9 @@ function Read-PatientFile {
         [Parameter(Mandatory)] [string] $Path,
         [Parameter(Mandatory)] [hashtable] $Cfg
     )
+
+    # Force local cache before Excel opens (eliminates the SharePoint download bar)
+    Invoke-PreCache -Path $Path
 
     $wb = Invoke-WithRetry -Label "open '$([IO.Path]::GetFileName($Path))'" -Action {
         $ExcelApp.Workbooks.Open($Path, $false, $true)   # UpdateLinks=false, ReadOnly=true
@@ -329,11 +354,36 @@ function Move-PatientToArchive {
     if (Test-Path $dest) {
         $dest = Join-Path $ArchiveCompanyDir ('{0}_{1:yyyyMMdd-HHmmss}{2}' -f $base, (Get-Date), $ext)
     }
-    Invoke-WithRetry -Label "archive $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 8 -InitialDelayMs 400 -Action {
-        Move-Item -Path $XlsmPath -Destination $dest -Force -ErrorAction Stop
-    }
-    Write-Host ("    Archived -> $dest") -ForegroundColor DarkGray
 
+    # COPY first (doesn't need exclusive lock, works even if SharePoint sync
+    # client is holding the file), then delete the original.
+    # If the delete fails we leave the original in place - the tracker row is
+    # already written, and the Iqama check will skip it on the next run.
+    Invoke-WithRetry -Label "copy to archive $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 8 -InitialDelayMs 400 -Action {
+        Copy-Item -Path $XlsmPath -Destination $dest -Force -ErrorAction Stop
+    }
+
+    # Verify the copy is complete before deleting the original
+    $srcSize  = (Get-Item $XlsmPath).Length
+    $destSize = (Get-Item $dest).Length
+    if ($destSize -eq $srcSize -and $destSize -gt 0) {
+        try {
+            Invoke-WithRetry -Label "delete original $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 5 -InitialDelayMs 500 -Action {
+                Remove-Item -Path $XlsmPath -Force -ErrorAction Stop
+            }
+            Write-Host ("    Archived -> $dest") -ForegroundColor DarkGray
+        } catch {
+            # Copy succeeded, delete failed - file stays in company folder.
+            # Next run will detect the Iqama as duplicate and skip it.
+            Write-Host ("    Copied to archive (original stays - will be skipped next run): $dest") -ForegroundColor DarkGray
+        }
+    } else {
+        # Copy looks incomplete - remove the bad copy, leave original
+        try { Remove-Item $dest -Force -ErrorAction SilentlyContinue } catch { }
+        throw "Archive copy size mismatch (src=$srcSize dest=$destSize). Original left in place."
+    }
+
+    # Handle matching PDF the same way
     $pdfSrc = Join-Path (Split-Path -Parent $XlsmPath) "$base.pdf"
     if (Test-Path $pdfSrc) {
         $pdfDest = Join-Path $ArchiveCompanyDir "$base.pdf"
@@ -341,9 +391,10 @@ function Move-PatientToArchive {
             $pdfDest = Join-Path $ArchiveCompanyDir ('{0}_{1:yyyyMMdd-HHmmss}.pdf' -f $base, (Get-Date))
         }
         try {
-            Invoke-WithRetry -Label "archive $base.pdf" -MaxAttempts 6 -Action {
-                Move-Item -Path $pdfSrc -Destination $pdfDest -Force -ErrorAction Stop
+            Invoke-WithRetry -Label "copy pdf $base.pdf" -MaxAttempts 6 -Action {
+                Copy-Item -Path $pdfSrc -Destination $pdfDest -Force -ErrorAction Stop
             }
+            try { Remove-Item -Path $pdfSrc -Force -ErrorAction SilentlyContinue } catch { }
         } catch {
             Write-Host "    (pdf archive skipped: $_)" -ForegroundColor DarkGray
         }
