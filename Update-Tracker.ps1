@@ -105,8 +105,12 @@ function Get-SafeCellValue {
     try {
         if ($null -eq $Cell) { return $DefaultValue }
         
+        # Explicitly get the top-left cell in case of merged ranges
+        # Use strictly [int] casts to prevent COM variant cast issues
+        $singleCell = $Cell.Cells.Item([int]1, [int]1)
+        
         # Check if cell contains an error value (#N/A, #VALUE!, etc.)
-        $text = $Cell.Text
+        $text = $singleCell.Text
         if ($null -ne $text) {
             $text = [string]$text
             # Error cells start with #
@@ -118,10 +122,10 @@ function Get-SafeCellValue {
         # Try to safely read Value2
         $val = $null
         try {
-            $val = $Cell.Value2
+            $val = $singleCell.Value2
         }
         catch {
-            # If Value2 fails, try Text
+            # If Value2 fails, default
             return $DefaultValue
         }
         
@@ -141,9 +145,9 @@ function Get-SafeCellValue {
 function ConvertTo-ColIndex {
     param([string] $Letter)
     $Letter = $Letter.ToUpper()
-    $idx = 0
+    [int]$idx = 0
     foreach ($c in $Letter.ToCharArray()) {
-        $idx = $idx * 26 + ([byte][char]$c - [byte][char]'A' + 1)
+        $idx = $idx * 26 + ([int][char]$c - [int][char]'A' + 1)
     }
     return $idx
 }
@@ -207,9 +211,10 @@ function Read-PatientFile {
     )
 
     Invoke-WithRetry {
-        $wb = $ExcelApp.Workbooks.Open($Path)
+        $wb = $ExcelApp.Workbooks.Open([string]$Path)
         try {
-            $sheet = $wb.Sheets.Item($Cfg.SourceSheet)
+            [string]$sheetName = $Cfg.SourceSheet
+        $sheet = $wb.Sheets.Item($sheetName)
 
             $data = [ordered]@{
                 SourceFile = $Path
@@ -285,7 +290,7 @@ function Read-PatientFile {
                         }
                     }
 
-                    $gCell = $sheet.Cells.Item($row, 7)
+                    $gCell = $sheet.Cells.Item($row, [int]7)
                     $isAbnormal = Test-CellIsHighlighted $gCell
                     $data.Tests[$t.TrackerCol] = if ($isAbnormal) { 'ABNORMAL' } else { 'NORMAL' }
                 }
@@ -326,10 +331,14 @@ function Write-TrackerRow {
 
     $fc = $Cfg.FixedColumns
 
+    [int]$r = $RowIndex
+
     function Set-Cell {
-        param($ColLetter, $Val)
+        param([string]$ColLetter, $Val)
         if ($null -ne $Val) {
-            $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $ColLetter)).Value2 = $Val
+            [int]$c = ConvertTo-ColIndex $ColLetter
+            if ($Val -is [DateTime]) { $Val = $Val.ToString('yyyy/MM/dd') }
+            $Sheet.Cells.Item($r, $c).Value2 = $Val
         }
     }
 
@@ -339,9 +348,10 @@ function Write-TrackerRow {
 
     # Iqama: write as text to preserve full digit precision
     if ($null -ne $Patient.Iqama) {
-        $iqamaCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.Iqama))
+        [int]$cIqama = ConvertTo-ColIndex $fc.Iqama
+        $iqamaCell = $Sheet.Cells.Item($r, $cIqama)
         $iqamaCell.NumberFormat = '@'
-        $iqamaCell.Value2 = $Patient.Iqama
+        $iqamaCell.Value2 = [string]$Patient.Iqama
     }
 
     Set-Cell $fc.Name $Patient.Name
@@ -350,7 +360,8 @@ function Write-TrackerRow {
     Set-Cell $fc.Weight $Patient.Weight
 
     # BMI as a live formula
-    $bmiCell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $fc.BMIFormula))
+    [int]$cBMI = ConvertTo-ColIndex $fc.BMIFormula
+    $bmiCell = $Sheet.Cells.Item($r, $cBMI)
     $bmiCell.Formula = '=J{0}/(I{0}/100)^2' -f $RowIndex
 
     Set-Cell $fc.Age $Patient.Age
@@ -372,9 +383,9 @@ function Write-TrackerRow {
 # ============================================================
 function Get-NextEmptyRow {
     param($Sheet)
-    $row = 2
+    [int]$row = 2
     while ($true) {
-        $cell = $Sheet.Cells.Item($row, 1)
+        $cell = $Sheet.Cells.Item($row, [int]1)
         $val = Get-SafeCellValue $cell
         if ($null -eq $val -or "$val".Trim() -eq '') {
             break
@@ -390,15 +401,15 @@ function Get-NextEmptyRow {
 function Test-IqamaExists {
     param($Sheet, [string] $Iqama)
     if ([string]::IsNullOrWhiteSpace($Iqama)) { return $false }
-    $row = 2
+    [int]$row = 2
     while ($true) {
-        $cellA = $Sheet.Cells.Item($row, 1)
+        $cellA = $Sheet.Cells.Item($row, [int]1)
         $valA = Get-SafeCellValue $cellA
         if ($null -eq $valA -or "$valA".Trim() -eq '') {
             break
         }
         
-        $cellD = $Sheet.Cells.Item($row, 4)
+        $cellD = $Sheet.Cells.Item($row, [int]4)
         $existing = Get-SafeCellValue $cellD
         if ($null -ne $existing -and "$existing".Trim() -eq $Iqama) { return $true }
         
@@ -485,7 +496,7 @@ $perCompanyStats = [ordered]@{}
 
 try {
     $Tracker = Invoke-WithRetry {
-        $Excel.Workbooks.Open($TrackerPath)
+        $Excel.Workbooks.Open([string]$TrackerPath)
     }
 
     $companyIdx = 0
@@ -534,12 +545,12 @@ try {
 
         $nextRow = Get-NextEmptyRow $sheet
         if ($nextRow -eq 2) {
-            $nextSN = 1
+            [int]$nextSN = 1
         }
         else {
-            $prevCell = $sheet.Cells.Item($nextRow - 1, 1)
+            $prevCell = $sheet.Cells.Item([int]($nextRow - 1), [int]1)
             $prev = Get-SafeCellValue $prevCell
-            $nextSN = if ($prev -as [int]) { [int]$prev + 1 } else { $nextRow - 1 }
+            [int]$nextSN = if ($prev -as [int]) { [int]$prev + 1 } else { $nextRow - 1 }
         }
         Write-Log "Next free row: $nextRow  (SN=$nextSN)  Files to process: $($files.Count)"
 
