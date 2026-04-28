@@ -108,54 +108,39 @@ function Assert-FileReady {
     # and hanging the COM background process.
     try {
         $null = [System.IO.File]::ReadAllBytes($FilePath)
-    } catch { }
+    }
+    catch { }
 }
 
 # ============================================================
 # Helper: safely read a cell value (handles error cells)
 # ============================================================
 function Get-SafeCellValue {
-    param(
-        [Parameter(Mandatory)] $Cell,
-        [string] $DefaultValue = $null
-    )
-    
-    try {
-        if ($null -eq $Cell) { return $DefaultValue }
-        
-        # Explicitly get the top-left cell in case of merged ranges
-        # Use strictly [int] casts to prevent COM variant cast issues
-        $singleCell = $Cell.Cells.Item([int]1, [int]1)
-        
-        # Try to safely read Value2
-        $val = $null
-        try {
-            $val = $singleCell.Value2
-        }
-        catch {
-            # If Value2 fails, default
-            return $DefaultValue
-        }
-        
-        # Check if it's a DBNull
-        if ($null -eq $val -or $val -is [System.DBNull]) {
-            return $DefaultValue
-        }
+    param ($cell)
 
-        # CRITICAL FIX: If the cell contains an Excel formula error (like #N/A or #VALUE!),
-        # powershell wraps it in a System.__ComObject. If we return this and later try to write
-        # it to the Tracker, it will instantly trigger "Specified cast is not valid".
-        if ($val -is [System.__ComObject]) {
-            return $DefaultValue
-        }
-        
-        return $val
+    if ($null -eq $cell) { return $null }
+
+    $value = $cell.Value2
+
+    if ($null -eq $value) { return $null }
+
+    if ($value -is [string]) {
+        $value = $value.Trim()
+        if ($value -eq "") { return $null }
     }
-    catch {
-        return $DefaultValue
+
+    return $value
+}
+$statusValue = Get-SafeCellValue $statusCell
+
+switch ($statusValue) {
+    "Fit"      { $isFit = $true }
+    "Unfit"    { $isFit = $false }
+    default    { 
+        Write-Host "Unknown status: $statusValue"
+        continue
     }
 }
-
 # ============================================================
 function ConvertTo-ColIndex {
     param([string] $Letter)
@@ -771,3 +756,45 @@ Write-Log ("Done. Processed={0}  Skipped={1}  Errors={2}  Elapsed={3}" -f $total
 Write-Log '======================================================'
 
 if ($totalErrors -gt 0) { exit 1 } else { exit 0 }
+
+
+
+$workbook.Close($false)
+$excel.Quit()
+
+[System.Runtime.Interopservices.Marshal]::ReleaseComObject($worksheet) | Out-Null
+[System.Runtime.Interopservices.Marshal]::ReleaseComObject($workbook) | Out-Null
+[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
+
+
+
+
+foreach ($row in 2..$lastRow) {
+
+    $statusCell = $worksheet.Cells.Item($row, 5)   # <-- adjust column
+    $idCell     = $worksheet.Cells.Item($row, 1)
+
+    $statusValue = Get-SafeCellValue $statusCell
+    $idValue     = Get-SafeCellValue $idCell
+
+    if ($null -eq $idValue) { continue }
+
+    if ($null -eq $statusValue) {
+        Write-Host "Row $row: Empty status"
+        continue
+    }
+
+    if ($statusValue -eq "Fit") {
+        Write-Host "Patient $idValue is FIT"
+    }
+    elseif ($statusValue -eq "Unfit") {
+        Write-Host "Patient $idValue is UNFIT"
+    }
+    else {
+        Write-Host "Row $row: Unknown status ($statusValue)"
+        continue
+    }
+}
