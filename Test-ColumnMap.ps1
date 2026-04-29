@@ -125,3 +125,269 @@ try {
 Write-Host '  Screenshot this entire window and send it.' -ForegroundColor Cyan
 Write-Host ''
 Read-Host '  Press Enter to close'
+---------------------------
+
+
+
+  ============================================================
+            AMC TRACKER  -  COLUMN MAPPING DIAGNOSTIC
+  ============================================================
+
+  === Sheet: AL AMSHAWI ===
+    A    SN
+    B    Date AMC
+    C    Date reviewed
+    D    Iqama
+    E    Name
+    F    Company
+    G    IM CONSLTATION
+    H    OPTHA. CONSULTATION
+    I    HEIGHT
+    J    WEIGHT
+    K    UPDATED BMI
+    L    CBC
+    M    FBS
+    N    SERUM BILIRUBIN
+    O    SGPT/ALT
+    P    SGOT/AST
+    Q    GGT
+    R    SERUM ALKALINE PHOSPHATASE
+    S    SERUM CHOLE
+    T    SERUM TRIGLYCERIDE
+    U    HDL
+    V    LDL
+    W    SERUM CREATININE
+    X    URIC ACID
+    Y    TSH
+    Z    UA
+    AA   STOOL
+    AB   X-RAY
+    AC   AUDIO
+    AD   SPIRO
+    AE   ECG
+    AF   PSA Above 40
+    AG   Abdominal Ultrasound
+    AH   AGE
+    AI   BP
+    AJ   status
+    AK   Comments
+    AL   Nurse 1
+
+  First data row (row 2):
+    A    [SN                    ] = 1
+    B    [Date AMC              ] = 46098
+    C    [Date reviewed         ] = 46112
+    D    [Iqama                 ] = 2568412825
+    E    [Name                  ] = MUHAMMADMUUAMMAD KHAN
+    F    [Company               ] = AL AMSHAWI
+    G    [IM CONSLTATION        ] = ABNORMAL
+    H    [OPTHA. CONSULTATION   ] = NORMAL
+    I    [HEIGHT                ] = 190
+    J    [WEIGHT                ] = 97
+    K    [UPDATED BMI           ] = 26.9
+    L    [CBC                   ] = NORMAL
+    M    [FBS                   ] = NORMAL
+    N    [SERUM BILIRUBIN       ] = NORMAL
+    O    [SGPT/ALT              ] = NORMAL
+    P    [SGOT/AST              ] = NORMAL
+    Q    [GGT                   ] = NORMAL
+    R    [SERUM ALKALINE PHOSPHATASE] = NORMAL
+    S    [SERUM CHOLE           ] = NORMAL
+    T    [SERUM TRIGLYCERIDE    ] = NORMAL
+    U    [HDL                   ] = NORMAL
+    V    [LDL                   ] = NORMAL
+    W    [SERUM CREATININE      ] = NORMAL
+    X    [URIC ACID             ] = NORMAL
+    Y    [TSH                   ] = NORMAL
+    Z    [UA                    ] = NORMAL
+    AA   [STOOL                 ] = NORMAL
+    AB   [X-RAY                 ] = NORMAL
+    AC   [AUDIO                 ] = NORMAL
+    AD   [SPIRO                 ] = NORMAL
+    AE   [ECG                   ] = NORMAL
+    AF   [PSA Above 40          ] = NORMAL
+    AG   [Abdominal Ultrasound  ] = NORMAL
+    AH   [AGE                   ] = 23
+    AI   [BP                    ] = 120/80
+    AJ   [status                ] = FIT
+    AL   [Nurse 1               ] = Hakim
+
+  === Sheet: AL JARI ===
+    A    SN
+    B    Date AMC
+    C    Date reviewed
+    D    Iqama
+    E    Name
+    F    Company
+    G    IM CONSLTATION
+    H    OPTHA. CONSULTATION
+    I    HEIGHT
+    J    WEIGHT
+    K    UPDATED BMI
+    L    CBC
+    M    FBS
+    N    SERUM BILIRUBIN
+    O    SGPT/ALT
+    P    SGOT/AST
+    Q    GGT
+    R    SERUM ALKALINE PHOSPHATASE
+    S    SERUM CHOLE
+    T    SERUM TRIGLYCERIDE
+    U    HDL
+    V    LDL
+    W    SERUM CREATININE
+    X    URIC ACID
+    Y    TSH
+    Z    UA
+    AA   STOOL
+    AB   X-RAY
+    AC   AUDIO
+    AD   SPIRO
+    AE   ECG
+    AF   PSA Above 40
+    AG   Abdominal U/S
+    AH   AGE
+    AI   BP
+    AJ   status
+    AK   Comments
+    AL   Nurse 1
+
+  First data row (row 2):
+    A    [SN                    ] = 1
+    B    [Date AMC              ] = 46043
+    C    [Date reviewed         ] = 46047
+    D    [Iqama                 ] = 1112658420
+    E    [Name                  ] = Abdul Malik Fraih Alharbi6
+    F    [Company               ] = Al JARI
+    G    [IM CONSLTATION        ] = NORMAL
+    H    [OPTHA. CONSULTATION   ] = NORMAL
+    I    [HEIGHT                ] = 174
+    J    [WEIGHT                ] = 88
+    K    [UPDATED BMI           ] = 29.1
+    L    [CBC                   ] = NORMAL
+    M    [FBS                   ] = NORMAL
+    N    [SERUM BILIRUBIN       ] = NORMAL
+    O    [SGPT/ALT              ] = NORMAL
+    P    [SGOT/AST              ] = NORMAL
+    Q    [GGT                   ] = NORMAL
+    R    [SERUM ALKALINE PHOSPHATASE] = NORMAL
+    S    [SERUM CHOLE           ] = NORMAL
+    T    [SERUM TRIGLYCERIDE    ] = NORMAL
+    U    [HDL                   ] = NORMAL
+    V    [LDL                   ] = NORMAL
+    W    [SERUM CREATININE      ] = NORMAL
+    X    [URIC ACID             ] = NORMAL
+    Y    [TSH                   ] = NORMAL
+    Z    [UA                    ] = NORMAL
+    AA   [STOOL                 ] = NORMAL
+    AB   [X-RAY                 ] = NORMAL
+    AC   [AUDIO                 ] = NORMAL
+    AD   [SPIRO                 ] = NORMAL
+    AE   [ECG                   ] = NORMAL
+    AG   [Abdominal U/S         ] = NORMAL
+    AH   [AGE                   ] = 25
+    AI   [BP                    ] = 120/80
+    AJ   [status                ] = FIT
+    AL   [Nurse 1               ] = mohamedin
+
+  === Full header map: AL MUTAIRI ===
+    A    SN
+    B    Date AMC
+    C    Date reviewed
+    D    Iqama
+    E    Name
+    F    Company
+    G    IM CONSLTATION
+    H    OPTHA. CONSULTATION
+    I    HEIGHT
+    J    WEIGHT
+    K    UPDATED BMI
+    L    CBC
+    M    FBS
+    N    SERUM BILIRUBIN
+    O    SGPT/ALT
+    P    SGOT/AST
+    Q    GGT
+    R    SERUM ALKALINE PHOSPHATASE
+    S    SERUM CHOLE
+    T    SERUM TRIGLYCERIDE
+    U    HDL
+    V    LDL
+    W    SERUM CREATININE
+    X    URIC ACID
+    Y    TSH
+    Z    UA
+    AA   STOOL
+    AB   X-RAY
+    AC   AUDIO
+    AD   SPIRO
+    AE   ECG
+    AF   PSA Above 40
+    AG   Abdominal Ultrasound
+    AH   AGE
+    AI   BP
+    AJ   status
+    AK   Comments
+    AL   Nurse 1
+
+  Next empty row in AL MUTAIRI: 48
+  Row 47 (last data row) col A-F:
+    A    = 46
+    B    =
+    C    =
+    D    =
+    E    =
+    F    =
+
+  === Full header map: SCMS ===
+    A    SN
+    B    Date AMC
+    C    Date reviewed
+    D    Iqama
+    E    Name
+    F    Company
+    G    IM CONSLTATION
+    H    OPTHA. CONSULTATION
+    I    HEIGHT
+    J    WEIGHT
+    K    UPDATED BMI
+    L    CBC
+    M    FBS
+    N    SERUM BILIRUBIN
+    O    SGPT/ALT
+    P    SGOT/AST
+    Q    GGT
+    R    SERUM ALKALINE PHOSPHATASE
+    S    SERUM CHOLE
+    T    SERUM TRIGLYCERIDE
+    U    HDL
+    V    LDL
+    W    SERUM CREATININE
+    X    URIC ACID
+    Y    TSH
+    Z    UA
+    AA   STOOL
+    AB   X-RAY
+    AC   AUDIO
+    AD   SPIRO
+    AE   ECG
+    AF   PSA Above 40
+    AG   Abdominal Ultrasound
+    AH   AGE
+    AI   BP
+    AJ   status
+    AK   Comments
+    AL   Nurse 1
+
+  Next empty row in SCMS: 40
+  Row 39 (last data row) col A-F:
+    A    = 38
+    B    = 46070
+    C    = 46140
+    D    = 2551598382
+    E    = KHALID AININA
+    F    = SCMS
+
+  Screenshot this entire window and send it.
+
+  Press Enter to close:
