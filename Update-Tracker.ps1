@@ -20,86 +20,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# ============================================================
-# PRE-CACHE: Forces SharePoint/OneDrive to download the file
-# locally before Excel tries to open it. Without this, the
-# Windows "Downloading..." blue bar appears mid-run and can
-# cause a brief lock race on the first open attempt.
-# ============================================================
-function Invoke-PreCache {
-    param([string] $Path)
-    try {
-        # Reading a few bytes forces the sync client to fully
-        # download the file to the local cache before we proceed.
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
-              [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $buf = New-Object byte[] 512
-        [void]$fs.Read($buf, 0, $buf.Length)
-        $fs.Close()
-        $fs.Dispose()
-        Start-Sleep -Milliseconds 100
-    } catch {
-        # If pre-cache fails, just continue - Excel will trigger
-        # the download itself (slower but still works)
-    }
-}
-# ============================================================
-# SAFE VALUE READER
-# Excel COM returns cell values as untyped VARIANTs.
-# Large integers (Iqama numbers > Int32.MaxValue) cause
-# "Specified cast is not valid" if PowerShell tries to box
-# them as Int32. We route everything through Double first,
-# then decide what to return.
-# ============================================================
-function Get-SafeValue {
-    param($RawValue)
-    if ($null -eq $RawValue) { return $null }
-    try {
-        if ($RawValue -is [string]) { return $RawValue.Trim() }
-        if ($RawValue -is [bool])   { return $RawValue }
-        if ($RawValue -is [datetime]) { return $RawValue }
-
-        # Numerics: route through Double to avoid Int32 overflow on large
-        # Iqama numbers. Return as Double so Excel preserves date formatting,
-        # decimals, etc. The caller (Write-TrackerRow) decides if it needs
-        # a string version (only for Iqama).
-        $d = [double]$RawValue
-        if ($d -lt -999999) { return $null }   # Excel error sentinel
-        return $d
-    } catch {
-        try { return [string]$RawValue } catch { return $null }
-    }
-}
-# ============================================================
-# SAFE INTERIOR COLOR CHECK
-# Returns $true if the cell has a non-default fill colour.
-# All COM property access is wrapped individually so one bad
-# cell doesn't crash the whole file.
-# ============================================================
-function Test-CellIsHighlighted {
-    param($Cell)
-    try {
-        # Get ColorIndex - use [double] cast to avoid Int32 overflow
-        $idx = $null
-        try { $idx = [double]$Cell.Interior.ColorIndex } catch { return $false }
-        if ($null -eq $idx)    { return $false }
-        if ($idx -eq -4142.0)  { return $false }   # xlColorIndexNone
-        if ($idx -eq 0.0)      { return $false }   # xlColorIndexAutomatic
-
-        # Check if it's plain white
-        $color = $null
-        try { $color = [double]$Cell.Interior.Color } catch { return $true }
-        if ($null -ne $color -and $color -eq 16777215.0) { return $false }
-
-        return $true
-    } catch {
-        return $false
-    }
-}
 
 # ============================================================
 # RETRY WRAPPER
-# Defends against transient file locks on network shares.
 # ============================================================
 function Invoke-WithRetry {
     param(
@@ -108,9 +31,7 @@ function Invoke-WithRetry {
         [int] $MaxAttempts = 6,
         [int] $InitialDelayMs = 250
     )
-    $attempt = 0
-    $delay   = $InitialDelayMs
-    $lastErr = $null
+    $attempt = 0; $delay = $InitialDelayMs; $lastErr = $null
     while ($attempt -lt $MaxAttempts) {
         $attempt++
         try { return & $Action }
@@ -125,21 +46,52 @@ function Invoke-WithRetry {
 }
 
 # ============================================================
-# Convert column letter to index (e.g. 'AH' -> 34)
+# COLUMN LETTER -> INDEX
 # ============================================================
 function ConvertTo-ColIndex {
     param([string] $Letter)
-    $Letter = $Letter.ToUpper()
     $idx = 0
-    foreach ($c in $Letter.ToCharArray()) {
+    foreach ($c in $Letter.ToUpper().ToCharArray()) {
         $idx = $idx * 26 + ([byte][char]$c - [byte][char]'A' + 1)
     }
     return $idx
 }
 
 # ============================================================
-# Release Excel workbook COM object and run GC.
-# Must be done before Move-Item on the same file.
+# SAFE VALUE FROM COM
+# Routes all numerics through [double] to avoid Int32 overflow
+# on 10-digit Iqama numbers.
+# ============================================================
+function Get-SafeValue {
+    param($Raw)
+    if ($null -eq $Raw) { return $null }
+    if ($Raw -is [string]) { return $Raw.Trim() }
+    if ($Raw -is [bool])   { return $Raw }
+    try {
+        $d = [double]$Raw
+        if ($d -lt -999999) { return $null }   # Excel error sentinel
+        return $d
+    } catch {
+        try { return [string]$Raw } catch { return $null }
+    }
+}
+
+# ============================================================
+# DETECT ABNORMAL (red fill on cell)
+# ============================================================
+function Test-CellIsHighlighted {
+    param($Cell)
+    try {
+        $idx = [double]$Cell.Interior.ColorIndex
+        if ($idx -eq -4142 -or $idx -eq 0) { return $false }
+        $color = [double]$Cell.Interior.Color
+        if ($color -eq 16777215) { return $false }   # plain white
+        return $true
+    } catch { return $false }
+}
+
+# ============================================================
+# RELEASE EXCEL WORKBOOK + GC
 # ============================================================
 function Release-Workbook {
     param($Workbook)
@@ -147,14 +99,26 @@ function Release-Workbook {
         try { $Workbook.Close($false) } catch { }
         try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($Workbook) } catch { }
     }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-    [GC]::Collect()
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect()
     Start-Sleep -Milliseconds 200
 }
 
 # ============================================================
-# Read one filled patient file
+# PRE-CACHE: force SharePoint to download file before Excel
+# ============================================================
+function Invoke-PreCache {
+    param([string] $Path)
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $buf = New-Object byte[] 512
+        [void]$fs.Read($buf, 0, $buf.Length)
+        $fs.Close(); $fs.Dispose()
+        Start-Sleep -Milliseconds 100
+    } catch { }
+}
+
+# ============================================================
+# READ ONE PATIENT AMCFORMULA FILE
 # ============================================================
 function Read-PatientFile {
     param(
@@ -163,56 +127,58 @@ function Read-PatientFile {
         [Parameter(Mandatory)] [hashtable] $Cfg
     )
 
-    # Force local cache before Excel opens (eliminates the SharePoint download bar)
     Invoke-PreCache -Path $Path
 
     $wb = Invoke-WithRetry -Label "open '$([IO.Path]::GetFileName($Path))'" -Action {
-        $ExcelApp.Workbooks.Open($Path, $false, $true)   # UpdateLinks=false, ReadOnly=true
+        $ExcelApp.Workbooks.Open($Path, $false, $true)
     }
 
     try {
         $ws = $wb.Sheets.Item($Cfg.SourceSheet)
 
         $data = [ordered]@{
-            SourceFile = $Path
-            Name       = $null; Company   = $null; Iqama     = $null
-            Age        = $null; DateAMC   = $null; DateReview= $null
-            BloodPress = $null; Height    = $null; Weight    = $null
-            Status     = $null; Comment   = $null; Tests     = @{}
+            Name = $null; Company = $null; Iqama = $null
+            Age  = $null; DateAMC = $null; DateReview = $null
+            BloodPress = $null; Height = $null; Weight = $null
+            Status = $null; Comment = $null; Tests = @{}
         }
 
-        # Read patient identity cells
+        # Identity cells
         foreach ($k in $Cfg.PatientCells.Keys) {
-            $addr = $Cfg.PatientCells[$k]
-            $raw  = $null
-            try { $raw = $ws.Range($addr).Value2 } catch { }
+            $raw = $null
+            try { $raw = $ws.Range($Cfg.PatientCells[$k]).Value2 } catch { }
             $data[$k] = Get-SafeValue $raw
         }
 
-        # Status: VBA writes ChrW(10003) into exactly one of I4:I7
-        $detectedStatus = $null
+        # Iqama must be a clean string of digits (no decimal point)
+        if ($null -ne $data.Iqama) {
+            $iqDouble = $null
+            try { $iqDouble = [double]$data.Iqama } catch { }
+            if ($null -ne $iqDouble) {
+                $data.Iqama = ([long]$iqDouble).ToString()
+            } else {
+                $data.Iqama = ([string]$data.Iqama).Trim()
+            }
+        }
+
+        # Status: checkmark (ChrW 10003) in I4:I7
         foreach ($s in $Cfg.StatusCandidates) {
             $raw = $null
             try { $raw = $ws.Range($s.CheckCell).Value2 } catch { }
-            $val = Get-SafeValue $raw
-            if ($null -ne $val -and [string]$val -ne '') {
-                $detectedStatus = $s.Label
-                break
+            if ($null -ne $raw -and [string]$raw -ne '') {
+                $data.Status = $s.Label; break
             }
         }
-        $data.Status = $detectedStatus
 
-        # Test results: red fill on column G = ABNORMAL
+        # Test results
         foreach ($t in $Cfg.TestRowMap) {
-            $row = [int] $t.FormulaRow
+            $row = [int]$t.FormulaRow
 
-            # PSA only for patients >= MinAge
             if ($t.ContainsKey('MinAge') -and $null -ne $data.Age) {
                 $ageVal = 0L
-                try { $ageVal = [long]$data.Age } catch { }
+                try { $ageVal = [long][double]$data.Age } catch { }
                 if ($ageVal -lt [long]$t.MinAge) {
-                    $data.Tests[$t.TrackerCol] = $null
-                    continue
+                    $data.Tests[$t.TrackerCol] = $null; continue
                 }
             }
 
@@ -220,21 +186,19 @@ function Read-PatientFile {
             try { $gCell = $ws.Cells.Item($row, 7) } catch { }
             $data.Tests[$t.TrackerCol] = if ($null -ne $gCell -and (Test-CellIsHighlighted $gCell)) {
                 'ABNORMAL'
-            } else {
-                'NORMAL'
-            }
+            } else { 'NORMAL' }
         }
 
         try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws) } catch { }
         return $data
-
     } finally {
         Release-Workbook $wb
     }
 }
 
 # ============================================================
-# Write one patient row into the tracker sheet
+# WRITE ONE ROW TO TRACKER
+# Direct individual cell writes — no script block scope tricks.
 # ============================================================
 function Write-TrackerRow {
     param(
@@ -246,59 +210,31 @@ function Write-TrackerRow {
     )
     $fc = $Cfg.FixedColumns
 
-    # Iqama goes in as TEXT (preserves all 10 digits + leading zeros)
-    $iqamaStr = $null
-    if ($null -ne $Patient.Iqama) {
-        if ($Patient.Iqama -is [double]) {
-            $iqamaStr = ([long]$Patient.Iqama).ToString()
-        } else {
-            $iqamaStr = ([string]$Patient.Iqama).Trim()
-        }
-    }
-
-    # Direct writes — no script block, no scope tricks. Each cell wrapped
-    # in its own try so one bad cell can't break the whole row.
-    $writes = @(
-        @{ Col = $fc.SerialNumber; Val = $SerialNumber;          AsText = $false }
-        @{ Col = $fc.DateAMC;      Val = $Patient.DateAMC;       AsText = $false }
-        @{ Col = $fc.DateReview;   Val = $Patient.DateReview;    AsText = $false }
-        @{ Col = $fc.Iqama;        Val = $iqamaStr;              AsText = $true  }
-        @{ Col = $fc.Name;         Val = $Patient.Name;          AsText = $false }
-        @{ Col = $fc.Company;      Val = $Patient.Company;       AsText = $false }
-        @{ Col = $fc.Height;       Val = $Patient.Height;        AsText = $false }
-        @{ Col = $fc.Weight;       Val = $Patient.Weight;        AsText = $false }
-        @{ Col = $fc.Age;          Val = $Patient.Age;           AsText = $false }
-        @{ Col = $fc.BloodPress;   Val = $Patient.BloodPress;    AsText = $false }
-        @{ Col = $fc.Status;       Val = $Patient.Status;        AsText = $false }
-        @{ Col = $fc.Comment;      Val = $Patient.Comment;       AsText = $false }
-    )
-
-    $writeFails = 0
-    foreach ($w in $writes) {
-        if ($null -eq $w.Val) { continue }
+    # Helper used inline so $Sheet and $RowIndex are always in scope
+    function Set-Cell {
+        param([string]$ColLetter, $Value, [bool]$AsText = $false)
+        if ($null -eq $Value) { return }
         try {
-            $cell = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $w.Col))
-            if ($w.AsText) { $cell.NumberFormat = '@' }
-            $cell.Value2 = $w.Val
+            $c = $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $ColLetter))
+            if ($AsText) { $c.NumberFormat = '@' }
+            $c.Value2 = $Value
         } catch {
-            $writeFails++
-            Write-Host ("           cell-write FAILED  col={0}  val={1}  err={2}" -f `
-                $w.Col, $w.Val, $_.Exception.Message) -ForegroundColor Magenta
+            Write-Host ("    cell-write ERR  col={0} val={1}: {2}" -f $ColLetter, $Value, $_.Exception.Message) -ForegroundColor Magenta
         }
     }
 
-    # Test result columns
-    foreach ($col in @($Patient.Tests.Keys)) {
-        $val = $Patient.Tests[$col]
-        if ($null -eq $val) { continue }
-        try {
-            $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $val
-        } catch {
-            $writeFails++
-            Write-Host ("           cell-write FAILED  col={0}  val={1}  err={2}" -f `
-                $col, $val, $_.Exception.Message) -ForegroundColor Magenta
-        }
-    }
+    Set-Cell $fc.SerialNumber $SerialNumber
+    Set-Cell $fc.DateAMC      $Patient.DateAMC
+    Set-Cell $fc.DateReview   $Patient.DateReview
+    Set-Cell $fc.Iqama        $Patient.Iqama   $true    # text format
+    Set-Cell $fc.Name         $Patient.Name
+    Set-Cell $fc.Company      $Patient.Company
+    Set-Cell $fc.Height       $Patient.Height
+    Set-Cell $fc.Weight       $Patient.Weight
+    Set-Cell $fc.Age          $Patient.Age
+    Set-Cell $fc.BloodPress   $Patient.BloodPress
+    Set-Cell $fc.Status       $Patient.Status
+    Set-Cell $fc.Comment      $Patient.Comment
 
     # BMI formula
     try {
@@ -306,55 +242,92 @@ function Write-TrackerRow {
             ('=J{0}/(I{0}/100)^2' -f $RowIndex)
     } catch { }
 
-    if ($writeFails -gt 0) {
-        Write-Host ("           {0} cell write(s) failed in row {1}" -f $writeFails, $RowIndex) -ForegroundColor Yellow
+    # Test results
+    foreach ($col in @($Patient.Tests.Keys)) {
+        $val = $Patient.Tests[$col]
+        if ($null -eq $val) { continue }
+        try {
+            $Sheet.Cells.Item($RowIndex, (ConvertTo-ColIndex $col)).Value2 = $val
+        } catch {
+            Write-Host ("    cell-write ERR  col={0} val={1}: {2}" -f $col, $val, $_.Exception.Message) -ForegroundColor Magenta
+        }
     }
 }
+
 # ============================================================
-# Find next empty row (column A = serial number, starts row 2)
+# FIND NEXT EMPTY ROW
+# A row is considered empty if BOTH column A and column E are
+# blank. This skips ghost rows that have only a serial number
+# from a previous partial run.
 # ============================================================
 function Get-NextEmptyRow {
     param($Sheet)
     $row = 2
     while ($true) {
-        $raw = $null
-        try { $raw = $Sheet.Cells.Item($row, 1).Value2 } catch { break }
-        if ($null -eq $raw) { break }
-        $str = ''
-        try { $str = [string]$raw } catch { }
-        if ($str.Trim() -eq '') { break }
+        $snVal   = $null
+        $nameVal = $null
+        try { $snVal   = $Sheet.Cells.Item($row, 1).Value2 } catch { break }
+        try { $nameVal = $Sheet.Cells.Item($row, 5).Value2 } catch { }
+
+        $snEmpty   = ($null -eq $snVal   -or [string]$snVal   -eq '')
+        $nameEmpty = ($null -eq $nameVal -or [string]$nameVal -eq '')
+
+        # Truly empty row = nothing in SN AND nothing in Name
+        if ($snEmpty -and $nameEmpty) { break }
         $row++
     }
     return $row
 }
 
 # ============================================================
-# Check if Iqama already exists in column D
+# GET SERIAL NUMBER FOR NEXT ROW
+# Scans up from nextRow to find last real SN value.
+# ============================================================
+function Get-NextSerialNumber {
+    param($Sheet, [int]$NextEmptyRow)
+    if ($NextEmptyRow -le 2) { return 1 }
+    # Walk backwards to find a row with both SN and Name filled
+    for ($r = $NextEmptyRow - 1; $r -ge 2; $r--) {
+        $snVal   = $null
+        $nameVal = $null
+        try { $snVal   = $Sheet.Cells.Item($r, 1).Value2 } catch { }
+        try { $nameVal = $Sheet.Cells.Item($r, 5).Value2 } catch { }
+        if ($null -ne $snVal -and [string]$snVal -ne '' -and
+            $null -ne $nameVal -and [string]$nameVal -ne '') {
+            $d = 0.0
+            if ([double]::TryParse([string]$snVal, [ref]$d)) {
+                return [int]$d + 1
+            }
+        }
+    }
+    return 1
+}
+
+# ============================================================
+# CHECK IQAMA EXISTS IN COLUMN D
 # ============================================================
 function Test-IqamaExists {
-    param($Sheet, [string] $Iqama)
+    param($Sheet, [string]$Iqama)
     if ([string]::IsNullOrWhiteSpace($Iqama)) { return $false }
     $row = 2
     while ($true) {
-        $snRaw = $null
-        try { $snRaw = $Sheet.Cells.Item($row, 1).Value2 } catch { break }
-        if ($null -eq $snRaw) { break }
-        $snStr = ''
-        try { $snStr = [string]$snRaw } catch { }
-        if ($snStr.Trim() -eq '') { break }
-
-        $iqRaw = $null
-        try { $iqRaw = $Sheet.Cells.Item($row, 4).Value2 } catch { }
-        $existing = ''
-        try { $existing = [string](Get-SafeValue $iqRaw) } catch { }
-        if ($existing -eq $Iqama) { return $true }
+        $sn = $null
+        try { $sn = $Sheet.Cells.Item($row, 1).Value2 } catch { break }
+        if ($null -eq $sn -or [string]$sn -eq '') { break }
+        $iq = $null
+        try { $iq = $Sheet.Cells.Item($row, 4).Value2 } catch { }
+        if ($null -ne $iq) {
+            $iqStr = ''
+            try { $iqStr = ([long][double]$iq).ToString() } catch { $iqStr = [string]$iq }
+            if ($iqStr.Trim() -eq $Iqama) { return $true }
+        }
         $row++
     }
     return $false
 }
 
 # ============================================================
-# Move xlsm (+ matching pdf) to Archive with retry
+# ARCHIVE PATIENT FILE (copy+delete, safer than Move-Item)
 # ============================================================
 function Move-PatientToArchive {
     param(
@@ -371,35 +344,27 @@ function Move-PatientToArchive {
         $dest = Join-Path $ArchiveCompanyDir ('{0}_{1:yyyyMMdd-HHmmss}{2}' -f $base, (Get-Date), $ext)
     }
 
-    # COPY first (doesn't need exclusive lock, works even if SharePoint sync
-    # client is holding the file), then delete the original.
-    # If the delete fails we leave the original in place - the tracker row is
-    # already written, and the Iqama check will skip it on the next run.
-    Invoke-WithRetry -Label "copy to archive $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 8 -InitialDelayMs 400 -Action {
+    Invoke-WithRetry -Label "copy $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 8 -InitialDelayMs 400 -Action {
         Copy-Item -Path $XlsmPath -Destination $dest -Force -ErrorAction Stop
     }
 
-    # Verify the copy is complete before deleting the original
-    $srcSize  = (Get-Item $XlsmPath).Length
-    $destSize = (Get-Item $dest).Length
-    if ($destSize -eq $srcSize -and $destSize -gt 0) {
+    $srcSize = (Get-Item $XlsmPath).Length
+    $dstSize = (Get-Item $dest).Length
+    if ($dstSize -eq $srcSize -and $dstSize -gt 0) {
         try {
-            Invoke-WithRetry -Label "delete original $([IO.Path]::GetFileName($XlsmPath))" -MaxAttempts 5 -InitialDelayMs 500 -Action {
+            Invoke-WithRetry -Label "delete original" -MaxAttempts 5 -InitialDelayMs 500 -Action {
                 Remove-Item -Path $XlsmPath -Force -ErrorAction Stop
             }
             Write-Host ("    Archived -> $dest") -ForegroundColor DarkGray
         } catch {
-            # Copy succeeded, delete failed - file stays in company folder.
-            # Next run will detect the Iqama as duplicate and skip it.
-            Write-Host ("    Copied to archive (original stays - will be skipped next run): $dest") -ForegroundColor DarkGray
+            Write-Host ("    Copied (original stays, skipped next run) -> $dest") -ForegroundColor DarkGray
         }
     } else {
-        # Copy looks incomplete - remove the bad copy, leave original
         try { Remove-Item $dest -Force -ErrorAction SilentlyContinue } catch { }
-        throw "Archive copy size mismatch (src=$srcSize dest=$destSize). Original left in place."
+        throw "Copy size mismatch. Original left in place."
     }
 
-    # Handle matching PDF the same way
+    # PDF
     $pdfSrc = Join-Path (Split-Path -Parent $XlsmPath) "$base.pdf"
     if (Test-Path $pdfSrc) {
         $pdfDest = Join-Path $ArchiveCompanyDir "$base.pdf"
@@ -407,7 +372,7 @@ function Move-PatientToArchive {
             $pdfDest = Join-Path $ArchiveCompanyDir ('{0}_{1:yyyyMMdd-HHmmss}.pdf' -f $base, (Get-Date))
         }
         try {
-            Invoke-WithRetry -Label "copy pdf $base.pdf" -MaxAttempts 6 -Action {
+            Invoke-WithRetry -Label "copy pdf" -MaxAttempts 6 -Action {
                 Copy-Item -Path $pdfSrc -Destination $pdfDest -Force -ErrorAction Stop
             }
             try { Remove-Item -Path $pdfSrc -Force -ErrorAction SilentlyContinue } catch { }
@@ -448,6 +413,16 @@ if (-not (Test-Path $TrackerPath)) {
     exit 1
 }
 
+# Check tracker is not locked
+try {
+    $fs = [System.IO.File]::Open($TrackerPath, 'Open', 'ReadWrite', 'None')
+    $fs.Close(); $fs.Dispose()
+} catch {
+    Write-Host '  ERROR: Tracker is open in Excel or locked by another process.' -ForegroundColor Red
+    Write-Host '  Close the tracker in Excel and try again.' -ForegroundColor Yellow
+    exit 1
+}
+
 $AllKeys = $Cfg.Companies.Keys | Sort-Object
 $keys = if ($Company.ToLower() -eq 'all') {
     $AllKeys
@@ -459,29 +434,7 @@ $keys = if ($Company.ToLower() -eq 'all') {
     }
     @($hit)
 }
-# Pre-flight: is the tracker already open in another Excel instance?
-# If yes, our Save() will silently go to a conflict copy.
-$lockProbe = $TrackerPath + '.amclock'
-$isLocked = $false
-try {
-    [System.IO.File]::Move($TrackerPath, $lockProbe)
-    [System.IO.File]::Move($lockProbe, $TrackerPath)
-} catch {
-    $isLocked = $true
-}
-if ($isLocked) {
-    Write-Host ''
-    Write-Host '  ============================================================' -ForegroundColor Red
-    Write-Host '  ERROR: The tracker file is currently LOCKED.' -ForegroundColor Red
-    Write-Host '  ============================================================' -ForegroundColor Red
-    Write-Host '  Someone (probably you, or another nurse) has the tracker' -ForegroundColor Red
-    Write-Host '  open in Excel right now. Any changes the script makes will' -ForegroundColor Red
-    Write-Host '  be lost or saved to a conflict copy.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host '  -> Close the tracker in Excel everywhere, then try again.' -ForegroundColor Yellow
-    Write-Host ''
-    exit 1
-}
+
 # Backup tracker
 if ($Cfg.BackupTrackerBeforeRun -and -not $DryRun) {
     $bkpDir = Join-Path $RootDir $Cfg.LogsDir
@@ -501,10 +454,8 @@ if ($Cfg.BackupTrackerBeforeRun -and -not $DryRun) {
 
 Write-Host '  Launching Excel...' -ForegroundColor DarkGray
 $Excel = New-Object -ComObject Excel.Application
-$Excel.Visible          = $false
-$Excel.DisplayAlerts    = $false
-$Excel.AskToUpdateLinks = $false
-try { $Excel.AutomationSecurity = 3 } catch { }   # msoAutomationSecurityForceDisable
+$Excel.Visible = $false; $Excel.DisplayAlerts = $false; $Excel.AskToUpdateLinks = $false
+try { $Excel.AutomationSecurity = 3 } catch { }
 
 $Tracker         = $null
 $totalProcessed  = 0
@@ -514,37 +465,16 @@ $startTime       = Get-Date
 $perCompanyStats = [ordered]@{}
 
 try {
-    # Notify=$false stops Excel from popping a "file in use" dialog and
-    # silently dropping us to read-only mode.
     $Tracker = Invoke-WithRetry -Label 'open tracker' -Action {
-        $Excel.Workbooks.Open(
-            $TrackerPath,   # Filename
-            $false,         # UpdateLinks
-            $false,         # ReadOnly
-            [Type]::Missing,# Format
-            [Type]::Missing,# Password
-            [Type]::Missing,# WriteResPassword
-            $true,          # IgnoreReadOnlyRecommended
-            [Type]::Missing,# Origin
-            [Type]::Missing,# Delimiter
-            $false          # Editable
-        )
+        $Excel.Workbooks.Open($TrackerPath, $false, $false)
     }
-
-    # CRITICAL: confirm we got a WRITABLE workbook, not a read-only copy
-    if ($Tracker.ReadOnly) {
-        throw "Tracker opened in READ-ONLY mode (another Excel instance has it). Close it everywhere and retry."
-    }
-
-    # CRITICAL: disable SharePoint AutoSave for our session.
-    # AutoSave intercepts Save() and can route it to a sync queue
-    # instead of immediately writing the file.
     try { $Tracker.AutoSaveOn = $false } catch { }
 
-    # Diagnostic: show exactly which file Excel actually opened.
-    Write-Host ("  Opened: {0}" -f $Tracker.FullName) -ForegroundColor DarkGray
-    Write-Host ("  Read-only: {0}   AutoSave: {1}" -f $Tracker.ReadOnly, `
-        $(try { $Tracker.AutoSaveOn } catch { 'n/a' })) -ForegroundColor DarkGray
+    if ($Tracker.ReadOnly) {
+        throw "Tracker opened READ-ONLY. Close it in Excel everywhere and retry."
+    }
+    Write-Host ("  Tracker: {0}  ReadOnly={1}" -f $Tracker.FullName, $Tracker.ReadOnly) -ForegroundColor DarkGray
+    Write-Host ''
 
     $companyIdx   = 0
     $companyTotal = $keys.Count
@@ -560,14 +490,14 @@ try {
         $perCompanyStats[$sheetName] = $coStats
 
         Write-Progress -Id 0 -Activity 'Processing companies' `
-            -Status ("$sheetName ({0} of {1})" -f $companyIdx, $companyTotal) `
-            -PercentComplete ([int](($companyIdx - 1) / [Math]::Max(1, $companyTotal) * 100))
+            -Status ("$sheetName ($companyIdx of $companyTotal)") `
+            -PercentComplete ([int](($companyIdx - 1) / [Math]::Max(1,$companyTotal) * 100))
 
         Write-Host ("  [{0}/{1}] {2}" -f $companyIdx, $companyTotal, $sheetName) -ForegroundColor White
 
         if (-not (Test-Path $folderPath)) {
             try { New-Item -ItemType Directory -Path $folderPath -Force | Out-Null } catch { }
-            Write-Host "         Folder created (was missing)." -ForegroundColor DarkGray
+            Write-Host "         Folder created." -ForegroundColor DarkGray
             continue
         }
 
@@ -581,39 +511,27 @@ try {
         try { $trackerSheet = $Tracker.Sheets.Item($sheetName) }
         catch {
             Write-Host "         ERROR: Sheet '$sheetName' not found in tracker." -ForegroundColor Red
-            $totalErrors += $files.Count
-            $coStats.Errors += $files.Count
+            $totalErrors += $files.Count; $coStats.Errors += $files.Count
             continue
         }
 
         $nextRow = Get-NextEmptyRow $trackerSheet
-        $prevSN  = $null
-        try { $prevSN = $trackerSheet.Cells.Item($nextRow - 1, 1).Value2 } catch { }
-        $nextSN = if ($nextRow -eq 2) {
-            1
-        } elseif ($null -ne $prevSN -and ($prevSN -as [double]) -ne $null) {
-            [int][double]$prevSN + 1
-        } else {
-            $nextRow - 1
-        }
+        $nextSN  = Get-NextSerialNumber $trackerSheet $nextRow
+        Write-Host ("         Next row: {0}  Next SN: {1}  Files: {2}" -f $nextRow, $nextSN, $files.Count) -ForegroundColor DarkGray
 
-        $fileIdx   = 0
-        $fileTotal = $files.Count
-
+        $fileIdx = 0
         foreach ($file in $files) {
             $fileIdx++
-            Write-Progress -Id 1 -ParentId 0 `
-                -Activity "Files in $sheetName" `
-                -Status ("$($file.Name)  ($fileIdx of $fileTotal)") `
-                -PercentComplete ([int](($fileIdx - 1) / [Math]::Max(1, $fileTotal) * 100))
+            Write-Progress -Id 1 -ParentId 0 -Activity "Files in $sheetName" `
+                -Status ("$($file.Name) ($fileIdx of $($files.Count))") `
+                -PercentComplete ([int](($fileIdx - 1) / [Math]::Max(1,$files.Count) * 100))
 
             try {
                 $patient = Read-PatientFile -ExcelApp $Excel -Path $file.FullName -Cfg $Cfg
 
                 if ([string]::IsNullOrWhiteSpace($patient.Iqama)) {
                     Write-Host "         SKIP $($file.Name) - Iqama empty" -ForegroundColor Yellow
-                    $totalSkipped++; $coStats.Skipped++
-                    continue
+                    $totalSkipped++; $coStats.Skipped++; continue
                 }
                 if (-not $patient.Status) {
                     Write-Host "         WARN $($file.Name) - no status checkmark" -ForegroundColor Yellow
@@ -622,26 +540,25 @@ try {
                 $exists = Test-IqamaExists -Sheet $trackerSheet -Iqama $patient.Iqama
                 if ($exists -and $Cfg.OnDuplicateIqama -eq 'skip') {
                     Write-Host "         SKIP $($file.Name) - Iqama $($patient.Iqama) already exists" -ForegroundColor Yellow
-                    $totalSkipped++; $coStats.Skipped++
-                    continue
+                    $totalSkipped++; $coStats.Skipped++; continue
                 }
                 if ($exists) {
                     Write-Host "         WARN Iqama $($patient.Iqama) already exists - adding anyway" -ForegroundColor Yellow
                 }
 
                 if ($DryRun) {
-                    $abn = ($patient.Tests.GetEnumerator() |
-                            Where-Object { $_.Value -eq 'ABNORMAL' } |
+                    $abn = ($patient.Tests.GetEnumerator() | Where-Object { $_.Value -eq 'ABNORMAL' } |
                             ForEach-Object { $_.Key }) -join ','
-                    Write-Host ("         DRY  row={0}  {1}  |  {2}  |  status={3}  |  abnormal={4}" -f `
+                    Write-Host ("         DRY  row={0} {1} | {2} | status={3} | abn={4}" -f `
                         $nextRow, $patient.Name, $patient.Iqama, $patient.Status,
-                        $(if ($abn) { $abn } else { 'none' })) -ForegroundColor Cyan
+                        $(if ($abn) {$abn} else {'none'})) -ForegroundColor Cyan
                     $totalProcessed++; $coStats.Written++
                 } else {
                     Write-TrackerRow -Sheet $trackerSheet -RowIndex $nextRow `
                         -SerialNumber $nextSN -Patient $patient -Cfg $Cfg
-                    Write-Host ("         OK   row={0}  {1}  ({2})  status={3}" -f `
-                        $nextRow, $patient.Name, $patient.Iqama, $patient.Status) -ForegroundColor Green
+
+                    Write-Host ("         OK   row={0} SN={1}  {2}  ({3})  status={4}" -f `
+                        $nextRow, $nextSN, $patient.Name, $patient.Iqama, $patient.Status) -ForegroundColor Green
                     $totalProcessed++; $coStats.Written++
 
                     if (-not $NoArchive) {
@@ -659,7 +576,6 @@ try {
                 $totalErrors++; $coStats.Errors++
             }
         }
-
         Write-Progress -Id 1 -Activity "Files in $sheetName" -Completed
     }
 
@@ -668,53 +584,31 @@ try {
     if (-not $DryRun) {
         Write-Host ''
         Write-Host '  Saving tracker...' -ForegroundColor DarkGray
-
-        # Capture file size + timestamp BEFORE save
-        $beforeInfo = Get-Item $TrackerPath
-        $beforeTime = $beforeInfo.LastWriteTime
-        $beforeSize = $beforeInfo.Length
-
+        $beforeSize = (Get-Item $TrackerPath).Length
+        $beforeTime = (Get-Item $TrackerPath).LastWriteTime
         try {
-            # Force xlOpenXMLWorkbookMacroEnabled (52) so macro-enabled .xlsm
-            # is preserved and we don't accidentally save to a converted format.
-            Invoke-WithRetry -Label 'save tracker' -MaxAttempts 6 -InitialDelayMs 500 -Action {
+            Invoke-WithRetry -Label 'save tracker' -MaxAttempts 8 -InitialDelayMs 500 -Action {
                 $Tracker.Save()
             }
-
-            # Wait briefly for SharePoint sync to commit
             Start-Sleep -Seconds 1
-
-            # VERIFY the file was actually changed on disk
             $afterInfo = Get-Item $TrackerPath
             if ($afterInfo.LastWriteTime -gt $beforeTime -or $afterInfo.Length -ne $beforeSize) {
-                Write-Host ("  Tracker saved.  ({0:N0} bytes -> {1:N0} bytes, modified {2:HH:mm:ss})" -f `
-                    $beforeSize, $afterInfo.Length, $afterInfo.LastWriteTime) -ForegroundColor Green
+                Write-Host ("  Tracker saved.  ({0:N0} -> {1:N0} bytes)" -f $beforeSize, $afterInfo.Length) -ForegroundColor Green
             } else {
-                Write-Host '' -ForegroundColor Yellow
-                Write-Host '  WARNING: Save() returned but the file timestamp did NOT change!' -ForegroundColor Yellow
-                Write-Host '  This usually means SharePoint AutoSave intercepted the write.' -ForegroundColor Yellow
-                Write-Host '  Trying SaveAs as a fallback...' -ForegroundColor Yellow
-
-                # Fallback: explicit SaveAs with the macro-enabled format (52)
-                try {
-                    $Tracker.SaveAs($TrackerPath, 52)
-                    Start-Sleep -Seconds 1
-                    $afterInfo2 = Get-Item $TrackerPath
-                    if ($afterInfo2.LastWriteTime -gt $beforeTime) {
-                        Write-Host ("  SaveAs succeeded.  ({0:N0} bytes, modified {1:HH:mm:ss})" -f `
-                            $afterInfo2.Length, $afterInfo2.LastWriteTime) -ForegroundColor Green
-                    } else {
-                        Write-Host '  ERROR: Even SaveAs did not update the file!' -ForegroundColor Red
-                        Write-Host '  Check that you have write permission to the tracker folder.' -ForegroundColor Red
-                        $totalErrors++
-                    }
-                } catch {
-                    Write-Host "  ERROR: SaveAs also failed: $_" -ForegroundColor Red
+                # Fallback: SaveAs with macro-enabled format
+                Write-Host '  Save() did not update file — trying SaveAs...' -ForegroundColor Yellow
+                $Tracker.SaveAs($TrackerPath, 52)
+                Start-Sleep -Seconds 1
+                $afterInfo2 = Get-Item $TrackerPath
+                if ($afterInfo2.LastWriteTime -gt $beforeTime) {
+                    Write-Host ("  SaveAs succeeded.  ({0:N0} bytes)" -f $afterInfo2.Length) -ForegroundColor Green
+                } else {
+                    Write-Host '  ERROR: File not updated even after SaveAs!' -ForegroundColor Red
                     $totalErrors++
                 }
             }
         } catch {
-            Write-Host "  ERROR: Tracker save failed: $_" -ForegroundColor Red
+            Write-Host "  ERROR: Save failed: $_" -ForegroundColor Red
             $totalErrors++
         }
     } else {
@@ -737,26 +631,20 @@ try {
 }
 
 $elapsed = '{0:hh\:mm\:ss}' -f ((Get-Date) - $startTime)
-
 Write-Host ''
 Write-Host '  ============================================================' -ForegroundColor Cyan
 Write-Host '                          S U M M A R Y                       ' -ForegroundColor Cyan
 Write-Host '  ============================================================' -ForegroundColor Cyan
 Write-Host ''
 if ($DryRun) {
-    Write-Host '   Mode:                  ' -NoNewline
-    Write-Host 'DRY-RUN (no changes written)' -ForegroundColor Yellow
+    Write-Host '   Mode:                  ' -NoNewline; Write-Host 'DRY-RUN' -ForegroundColor Yellow
 } else {
-    Write-Host '   Mode:                  ' -NoNewline
-    Write-Host 'LIVE (tracker updated)' -ForegroundColor Green
+    Write-Host '   Mode:                  ' -NoNewline; Write-Host 'LIVE (tracker updated)' -ForegroundColor Green
 }
 Write-Host ('   Companies scanned:     {0}' -f $keys.Count)
-Write-Host ('   Patient files written: {0}' -f $totalProcessed) `
-    -ForegroundColor $(if ($totalProcessed -gt 0) { 'Green' } else { 'Gray' })
-Write-Host ('   Files skipped:         {0}' -f $totalSkipped) `
-    -ForegroundColor $(if ($totalSkipped -gt 0) { 'Yellow' } else { 'Gray' })
-Write-Host ('   Errors:                {0}' -f $totalErrors) `
-    -ForegroundColor $(if ($totalErrors -gt 0) { 'Red' } else { 'Gray' })
+Write-Host ('   Patient files written: {0}' -f $totalProcessed) -ForegroundColor $(if($totalProcessed -gt 0){'Green'}else{'Gray'})
+Write-Host ('   Files skipped:         {0}' -f $totalSkipped)   -ForegroundColor $(if($totalSkipped  -gt 0){'Yellow'}else{'Gray'})
+Write-Host ('   Errors:                {0}' -f $totalErrors)    -ForegroundColor $(if($totalErrors   -gt 0){'Red'}else{'Gray'})
 Write-Host ('   Time elapsed:          {0}' -f $elapsed)
 Write-Host ''
 
@@ -765,15 +653,12 @@ $active = @($perCompanyStats.GetEnumerator() | Where-Object {
 })
 if ($active.Count -gt 0) {
     Write-Host '   Per-company breakdown:' -ForegroundColor White
-    Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f 'Company','Written','Skipped','Errors') `
-        -ForegroundColor DarkGray
-    Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f ('-'*22),('-'*8),('-'*8),('-'*8)) `
-        -ForegroundColor DarkGray
+    Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f 'Company','Written','Skipped','Errors') -ForegroundColor DarkGray
+    Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f ('-'*22),('-'*8),('-'*8),('-'*8)) -ForegroundColor DarkGray
     foreach ($e in $active) {
         $s = $e.Value
-        $c = if ($s.Errors -gt 0) { 'Red' } elseif ($s.Written -gt 0) { 'Green' } else { 'Yellow' }
-        Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f $s.Sheet,$s.Written,$s.Skipped,$s.Errors) `
-            -ForegroundColor $c
+        $c = if ($s.Errors -gt 0){'Red'} elseif($s.Written -gt 0){'Green'} else {'Yellow'}
+        Write-Host ('     {0,-22} {1,8} {2,8} {3,8}' -f $s.Sheet,$s.Written,$s.Skipped,$s.Errors) -ForegroundColor $c
     }
     Write-Host ''
 }
